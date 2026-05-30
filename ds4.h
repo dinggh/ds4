@@ -138,6 +138,7 @@ int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
+bool ds4_engine_is_qwen(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -173,6 +174,28 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
+int ds4_engine_qwen_state_test(ds4_engine *e, int ctx_size);
+int ds4_engine_qwen_embed_test(ds4_engine *e, int token);
+int ds4_engine_qwen_rms_test(ds4_engine *e, int token);
+int ds4_engine_qwen_qkv_test(ds4_engine *e, int token);
+int ds4_engine_qwen_attn_gate_test(ds4_engine *e, int token);
+int ds4_engine_qwen_ssm_out_test(ds4_engine *e, int token);
+int ds4_engine_qwen_gdn_param_test(ds4_engine *e, int token);
+int ds4_engine_qwen_gdn_zero_test(ds4_engine *e, int token);
+int ds4_engine_qwen_gdn_stateful_test(ds4_engine *e, int token0, int token1);
+int ds4_engine_qwen_session_step_test(ds4_engine *e, int token0, int token1, int ctx_size);
+int ds4_engine_qwen_snapshot_test(ds4_engine *e, int token0, int token1, int ctx_size);
+int ds4_engine_qwen_layer0_zero_test(ds4_engine *e, int token);
+int ds4_engine_qwen_layer0_logits_test(ds4_engine *e, int token);
+int ds4_engine_qwen_prefix4_logits_test(ds4_engine *e, int token);
+int ds4_engine_qwen_mtp_proj_test(ds4_engine *e, int token);
+int ds4_engine_qwen_mtp_layer_test(ds4_engine *e, int token);
+int ds4_engine_qwen_mtp_draft_test(ds4_engine *e, int token);
+int ds4_engine_qwen_full_attn_test(ds4_engine *e, int token);
+int ds4_engine_qwen_ffn_gate_test(ds4_engine *e, int token);
+int ds4_engine_qwen_ffn_down_test(ds4_engine *e, int token);
+int ds4_engine_qwen_ffn_test(ds4_engine *e, int token);
+int ds4_engine_qwen_moe_ffn_test(ds4_engine *e, int token);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
@@ -255,6 +278,8 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
+bool ds4_qwen_arch_alias_self_test(FILE *fp);
+
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);
@@ -282,6 +307,9 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 #define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+#define DS4_QWEN_SESSION_PAYLOAD_MAGIC UINT32_C(0x51565344) /* "DSVQ" */
+#define DS4_QWEN_SESSION_PAYLOAD_VERSION UINT32_C(1)
+#define DS4_QWEN_SESSION_PAYLOAD_U32_FIELDS 15u
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u

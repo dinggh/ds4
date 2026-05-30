@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,9 +43,34 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    int qwen_embed_test_token;
+    int qwen_rms_test_token;
+    int qwen_qkv_test_token;
+    int qwen_attn_gate_test_token;
+    int qwen_ssm_out_test_token;
+    int qwen_gdn_param_test_token;
+    int qwen_gdn_zero_test_token;
+    int qwen_gdn_stateful_test_token0;
+    int qwen_gdn_stateful_test_token1;
+    int qwen_session_step_test_token0;
+    int qwen_session_step_test_token1;
+    int qwen_snapshot_test_token0;
+    int qwen_snapshot_test_token1;
+    int qwen_layer0_zero_test_token;
+    int qwen_layer0_logits_test_token;
+    int qwen_prefix4_logits_test_token;
+    int qwen_mtp_proj_test_token;
+    int qwen_mtp_layer_test_token;
+    int qwen_mtp_draft_test_token;
+    int qwen_full_attn_test_token;
+    int qwen_ffn_gate_test_token;
+    int qwen_ffn_down_test_token;
+    int qwen_ffn_test_token;
+    int qwen_moe_ffn_test_token;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
+    bool qwen_state_test;
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
@@ -241,6 +267,50 @@ static void usage(FILE *fp) {
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
         "      Run an exact CPU whole-model pass for the first prompt token.\n"
+        "  --qwen-state-test\n"
+        "      Allocate and release native Qwen runtime state buffers for --ctx.\n"
+        "  --qwen-embed-test TOKEN\n"
+        "      Decode one Qwen token embedding row through the native CPU reference path.\n"
+        "  --qwen-rms-test TOKEN\n"
+        "      Decode one Qwen token embedding and apply blk.0 attention RMSNorm.\n"
+        "  --qwen-qkv-test TOKEN\n"
+        "      Run blk.0 recurrent attn_qkv projection from the native RMSNorm output.\n"
+        "  --qwen-attn-gate-test TOKEN\n"
+        "      Run blk.0 recurrent attn_gate IQ3_XXS projection from the native RMSNorm output.\n"
+        "  --qwen-ssm-out-test TOKEN\n"
+        "      Run blk.0 ssm_out Q5_K projection from the native attn_qkv value slice.\n"
+        "  --qwen-gdn-param-test TOKEN\n"
+        "      Run blk.0 recurrent GDN beta/alpha/g and zero-state conv parameter path.\n"
+        "  --qwen-gdn-zero-test TOKEN\n"
+        "      Run blk.0 recurrent GDN zero-state update, gated norm, and ssm_out path.\n"
+        "  --qwen-gdn-stateful-test TOKEN0 TOKEN1\n"
+        "      Run two blk.0 recurrent GDN steps with conv and recurrent state updates.\n"
+        "  --qwen-session-step-test TOKEN0 TOKEN1\n"
+        "      Run two blk.0 GDN steps using ds4_session Qwen state buffers for --ctx.\n"
+        "  --qwen-snapshot-test TOKEN0 TOKEN1\n"
+        "      Verify Qwen session snapshot/restore exactness after replaying TOKEN1.\n"
+        "  --qwen-layer0-zero-test TOKEN\n"
+        "      Run blk.0 zero-state GDN residual plus dense FFN residual path.\n"
+        "  --qwen-layer0-logits-test TOKEN\n"
+        "      Run blk.0 zero-state residual path through output_norm and Q8_0 logits head.\n"
+        "  --qwen-prefix4-logits-test TOKEN\n"
+        "      Run Qwen layers 0-3 recurrent/full-attention prefix through output_norm and logits.\n"
+        "  --qwen-mtp-proj-test TOKEN\n"
+        "      Run the first Qwen MTP/NextN enorm+hnorm+eh_proj micro-path.\n"
+        "  --qwen-mtp-layer-test TOKEN\n"
+        "      Run the first Qwen MTP/NextN projection plus full-attn/FFN layer micro-path.\n"
+        "  --qwen-mtp-draft-test TOKEN\n"
+        "      Run Qwen MTP/NextN draft logits from the native main hidden state.\n"
+        "  --qwen-full-attn-test TOKEN\n"
+        "      Run the first full-attention layer self-token projection/output path.\n"
+        "  --qwen-ffn-gate-test TOKEN\n"
+        "      Run dense blk.0 ffn_gate Q2_K projection from the native token embedding.\n"
+        "  --qwen-ffn-down-test TOKEN\n"
+        "      Run dense blk.0 ffn_down Q3_K projection from the native ffn_gate output.\n"
+        "  --qwen-ffn-test TOKEN\n"
+        "      Run dense blk.0 ffn_norm + SwiGLU FFN through native Q2_K/Q3_K paths.\n"
+        "  --qwen-moe-ffn-test TOKEN\n"
+        "      Run MoE blk.0 ffn_norm + routed/shared expert FFN through the native path.\n"
         "  --metal-graph-test\n"
         "      Compare first GPU-resident graph stages with CPU.\n"
         "  --metal-graph-full-test\n"
@@ -267,6 +337,16 @@ static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonnegative_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
         fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
@@ -534,6 +614,133 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
         ds4_encode_chat_prompt(engine, gen->system, gen->prompt,
                                cli_effective_think_mode(gen), out);
     }
+}
+
+static const char *qwen_compat_llama_cli(void) {
+    const char *env = getenv("DS4_QWEN_LLAMA_CLI");
+    if (env && env[0] && access(env, X_OK) == 0) return env;
+
+    static const char bundled[] = "third_party/llama.cpp-bin/llama-b9415/llama-cli";
+    if (access(bundled, X_OK) == 0) return bundled;
+
+    return "llama-cli";
+}
+
+static int run_qwen_compat_generation(ds4_engine *engine, const cli_config *cfg) {
+    (void)engine;
+
+    const char *llama_cli = qwen_compat_llama_cli();
+    char n_predict[32];
+    char ctx_size[32];
+    char temp[64];
+    char top_p[64];
+    char min_p[64];
+    char threads[32];
+    char draft_tokens[32];
+    snprintf(n_predict, sizeof(n_predict), "%d", cfg->gen.n_predict);
+    snprintf(ctx_size, sizeof(ctx_size), "%d", cfg->gen.ctx_size);
+    snprintf(temp, sizeof(temp), "%.8g", (double)cfg->gen.temperature);
+    snprintf(top_p, sizeof(top_p), "%.8g", (double)cfg->gen.top_p);
+    snprintf(min_p, sizeof(min_p), "%.8g", (double)cfg->gen.min_p);
+    snprintf(threads, sizeof(threads), "%d", cfg->engine.n_threads > 0 ? cfg->engine.n_threads : -1);
+    snprintf(draft_tokens, sizeof(draft_tokens), "%d", cfg->engine.mtp_draft_tokens);
+
+    const char *reasoning = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)) ? "on" : "off";
+    const char *prompt = cfg->gen.prompt ? cfg->gen.prompt : "";
+    const char *system = cfg->gen.system ? cfg->gen.system : "";
+
+    const char *argv[40];
+    int a = 0;
+    argv[a++] = llama_cli;
+    argv[a++] = "-m";
+    argv[a++] = cfg->engine.model_path;
+    argv[a++] = "-p";
+    argv[a++] = prompt;
+    argv[a++] = "-sys";
+    argv[a++] = system;
+    argv[a++] = "-n";
+    argv[a++] = n_predict;
+    argv[a++] = "-c";
+    argv[a++] = ctx_size;
+    argv[a++] = "-t";
+    argv[a++] = threads;
+    argv[a++] = "--temp";
+    argv[a++] = temp;
+    argv[a++] = "--top-p";
+    argv[a++] = top_p;
+    argv[a++] = "--min-p";
+    argv[a++] = min_p;
+    argv[a++] = "--no-display-prompt";
+    argv[a++] = "--conversation";
+    argv[a++] = "--single-turn";
+    argv[a++] = "--reasoning";
+    argv[a++] = reasoning;
+    argv[a++] = "-fa";
+    argv[a++] = "auto";
+    if (cfg->engine.mtp_draft_tokens > 1) {
+        argv[a++] = "--spec-type";
+        argv[a++] = "draft-mtp";
+        argv[a++] = "--spec-draft-n-max";
+        argv[a++] = draft_tokens;
+    }
+    argv[a] = NULL;
+
+    fprintf(stderr, "ds4: using Qwen llama.cpp compatibility backend: %s\n",
+            llama_cli);
+    fflush(stderr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "ds4: failed to fork Qwen compatibility backend: %s\n", strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        execv(llama_cli, (char * const *)argv);
+        execvp(llama_cli, (char * const *)argv);
+        fprintf(stderr,
+                "ds4: failed to execute %s. Set DS4_QWEN_LLAMA_CLI or run scripts/install_qwen_compat_backend.sh\n",
+                llama_cli);
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr, "ds4: failed waiting for Qwen compatibility backend: %s\n", strerror(errno));
+        return 1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) {
+        fprintf(stderr, "ds4: Qwen compatibility backend terminated by signal %d\n", WTERMSIG(status));
+    }
+    return 1;
+}
+
+static const char *qwen_native_only_mode(const cli_config *cfg) {
+    if (cfg->gen.imatrix_output_path) return "imatrix collection";
+    if (cfg->gen.perplexity_file_path) return "perplexity scoring";
+    if (cfg->gen.metal_graph_test) return "metal graph test";
+    if (cfg->gen.metal_graph_full_test) return "metal graph full test";
+    if (cfg->gen.metal_graph_prompt_test) return "metal graph prompt test";
+    if (cfg->gen.head_test) return "head test";
+    if (cfg->gen.first_token_test) return "first-token test";
+    return NULL;
+}
+
+static int reject_qwen_native_only_mode(const cli_config *cfg) {
+    const char *mode = qwen_native_only_mode(cfg);
+    if (!mode) return 0;
+    fprintf(stderr,
+            "ds4: Qwen %s is not supported by the native Qwen CLI path yet\n",
+            mode);
+    return 2;
+}
+
+static bool qwen_compat_generation_enabled(void) {
+    const char *compat = getenv("DS4_QWEN_COMPAT_GENERATE");
+    if (compat && compat[0] && strcmp(compat, "0") != 0) return true;
+    const char *native = getenv("DS4_QWEN_NATIVE_GENERATE");
+    return native && native[0] && strcmp(native, "0") == 0;
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -1037,7 +1244,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
+    } else if (ds4_engine_is_qwen(engine) ||
+               cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
                cfg->gen.temperature > 0.0f ||
                ds4_engine_mtp_draft_tokens(engine) > 1) {
         rc = run_sampled_generation(engine, cfg, &prompt);
@@ -1522,6 +1730,30 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
+            .qwen_embed_test_token = -1,
+            .qwen_rms_test_token = -1,
+            .qwen_qkv_test_token = -1,
+            .qwen_attn_gate_test_token = -1,
+            .qwen_ssm_out_test_token = -1,
+            .qwen_gdn_param_test_token = -1,
+            .qwen_gdn_zero_test_token = -1,
+            .qwen_gdn_stateful_test_token0 = -1,
+            .qwen_gdn_stateful_test_token1 = -1,
+            .qwen_session_step_test_token0 = -1,
+            .qwen_session_step_test_token1 = -1,
+            .qwen_snapshot_test_token0 = -1,
+            .qwen_snapshot_test_token1 = -1,
+            .qwen_layer0_zero_test_token = -1,
+            .qwen_layer0_logits_test_token = -1,
+            .qwen_prefix4_logits_test_token = -1,
+            .qwen_mtp_proj_test_token = -1,
+            .qwen_mtp_layer_test_token = -1,
+            .qwen_mtp_draft_test_token = -1,
+            .qwen_full_attn_test_token = -1,
+            .qwen_ffn_gate_test_token = -1,
+            .qwen_ffn_down_test_token = -1,
+            .qwen_ffn_test_token = -1,
+            .qwen_moe_ffn_test_token = -1,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -1643,6 +1875,53 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {
             c.gen.first_token_test = true;
+        } else if (!strcmp(arg, "--qwen-state-test")) {
+            c.gen.qwen_state_test = true;
+        } else if (!strcmp(arg, "--qwen-embed-test")) {
+            c.gen.qwen_embed_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-rms-test")) {
+            c.gen.qwen_rms_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-qkv-test")) {
+            c.gen.qwen_qkv_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-attn-gate-test")) {
+            c.gen.qwen_attn_gate_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-ssm-out-test")) {
+            c.gen.qwen_ssm_out_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-gdn-param-test")) {
+            c.gen.qwen_gdn_param_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-gdn-zero-test")) {
+            c.gen.qwen_gdn_zero_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-gdn-stateful-test")) {
+            c.gen.qwen_gdn_stateful_test_token0 = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.qwen_gdn_stateful_test_token1 = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-session-step-test")) {
+            c.gen.qwen_session_step_test_token0 = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.qwen_session_step_test_token1 = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-snapshot-test")) {
+            c.gen.qwen_snapshot_test_token0 = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.qwen_snapshot_test_token1 = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-layer0-zero-test")) {
+            c.gen.qwen_layer0_zero_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-layer0-logits-test")) {
+            c.gen.qwen_layer0_logits_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-prefix4-logits-test")) {
+            c.gen.qwen_prefix4_logits_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-mtp-proj-test")) {
+            c.gen.qwen_mtp_proj_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-mtp-layer-test")) {
+            c.gen.qwen_mtp_layer_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-mtp-draft-test")) {
+            c.gen.qwen_mtp_draft_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-full-attn-test")) {
+            c.gen.qwen_full_attn_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-ffn-gate-test")) {
+            c.gen.qwen_ffn_gate_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-ffn-down-test")) {
+            c.gen.qwen_ffn_down_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-ffn-test")) {
+            c.gen.qwen_ffn_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--qwen-moe-ffn-test")) {
+            c.gen.qwen_moe_ffn_test_token = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
@@ -1736,13 +2015,97 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
+    if (!cfg.inspect && !ds4_engine_is_qwen(engine)) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
     if (cfg.inspect) {
         ds4_engine_summary(engine);
+    } else if (cfg.gen.qwen_ssm_out_test_token >= 0) {
+        rc = ds4_engine_qwen_ssm_out_test(engine, cfg.gen.qwen_ssm_out_test_token);
+    } else if (cfg.gen.qwen_gdn_param_test_token >= 0) {
+        rc = ds4_engine_qwen_gdn_param_test(engine, cfg.gen.qwen_gdn_param_test_token);
+    } else if (cfg.gen.qwen_gdn_zero_test_token >= 0) {
+        rc = ds4_engine_qwen_gdn_zero_test(engine, cfg.gen.qwen_gdn_zero_test_token);
+    } else if (cfg.gen.qwen_gdn_stateful_test_token0 >= 0) {
+        rc = ds4_engine_qwen_gdn_stateful_test(engine,
+                                              cfg.gen.qwen_gdn_stateful_test_token0,
+                                              cfg.gen.qwen_gdn_stateful_test_token1);
+    } else if (cfg.gen.qwen_session_step_test_token0 >= 0) {
+        rc = ds4_engine_qwen_session_step_test(engine,
+                                              cfg.gen.qwen_session_step_test_token0,
+                                              cfg.gen.qwen_session_step_test_token1,
+                                              cfg.gen.ctx_size);
+    } else if (cfg.gen.qwen_snapshot_test_token0 >= 0) {
+        rc = ds4_engine_qwen_snapshot_test(engine,
+                                          cfg.gen.qwen_snapshot_test_token0,
+                                          cfg.gen.qwen_snapshot_test_token1,
+                                          cfg.gen.ctx_size);
+    } else if (cfg.gen.qwen_layer0_zero_test_token >= 0) {
+        rc = ds4_engine_qwen_layer0_zero_test(engine, cfg.gen.qwen_layer0_zero_test_token);
+    } else if (cfg.gen.qwen_layer0_logits_test_token >= 0) {
+        rc = ds4_engine_qwen_layer0_logits_test(engine, cfg.gen.qwen_layer0_logits_test_token);
+    } else if (cfg.gen.qwen_prefix4_logits_test_token >= 0) {
+        rc = ds4_engine_qwen_prefix4_logits_test(engine, cfg.gen.qwen_prefix4_logits_test_token);
+    } else if (cfg.gen.qwen_mtp_proj_test_token >= 0) {
+        rc = ds4_engine_qwen_mtp_proj_test(engine, cfg.gen.qwen_mtp_proj_test_token);
+    } else if (cfg.gen.qwen_mtp_layer_test_token >= 0) {
+        rc = ds4_engine_qwen_mtp_layer_test(engine, cfg.gen.qwen_mtp_layer_test_token);
+    } else if (cfg.gen.qwen_mtp_draft_test_token >= 0) {
+        rc = ds4_engine_qwen_mtp_draft_test(engine, cfg.gen.qwen_mtp_draft_test_token);
+    } else if (cfg.gen.qwen_full_attn_test_token >= 0) {
+        rc = ds4_engine_qwen_full_attn_test(engine, cfg.gen.qwen_full_attn_test_token);
+    } else if (cfg.gen.qwen_ffn_down_test_token >= 0) {
+        rc = ds4_engine_qwen_ffn_down_test(engine, cfg.gen.qwen_ffn_down_test_token);
+    } else if (cfg.gen.qwen_ffn_test_token >= 0) {
+        rc = ds4_engine_qwen_ffn_test(engine, cfg.gen.qwen_ffn_test_token);
+    } else if (cfg.gen.qwen_moe_ffn_test_token >= 0) {
+        rc = ds4_engine_qwen_moe_ffn_test(engine, cfg.gen.qwen_moe_ffn_test_token);
+    } else if (cfg.gen.qwen_ffn_gate_test_token >= 0) {
+        rc = ds4_engine_qwen_ffn_gate_test(engine, cfg.gen.qwen_ffn_gate_test_token);
+    } else if (cfg.gen.qwen_attn_gate_test_token >= 0) {
+        rc = ds4_engine_qwen_attn_gate_test(engine, cfg.gen.qwen_attn_gate_test_token);
+    } else if (cfg.gen.qwen_qkv_test_token >= 0) {
+        rc = ds4_engine_qwen_qkv_test(engine, cfg.gen.qwen_qkv_test_token);
+    } else if (cfg.gen.qwen_rms_test_token >= 0) {
+        rc = ds4_engine_qwen_rms_test(engine, cfg.gen.qwen_rms_test_token);
+    } else if (cfg.gen.qwen_embed_test_token >= 0) {
+        rc = ds4_engine_qwen_embed_test(engine, cfg.gen.qwen_embed_test_token);
+    } else if (cfg.gen.qwen_state_test) {
+        rc = ds4_engine_qwen_state_test(engine, cfg.gen.ctx_size);
+    } else if (ds4_engine_is_qwen(engine)) {
+        rc = reject_qwen_native_only_mode(&cfg);
+        if (rc != 0) {
+            /* error already printed */
+        } else if (cfg.gen.dump_logits_path) {
+            if (cfg.gen.prompt == NULL) {
+                fprintf(stderr, "ds4: Qwen logits dump requires -p/--prompt\n");
+                rc = 2;
+            } else {
+                ds4_tokens qwen_prompt = {0};
+                build_prompt(engine, &cfg.gen, &qwen_prompt);
+                rc = run_logits_dump(engine, &cfg, &qwen_prompt);
+                ds4_tokens_free(&qwen_prompt);
+            }
+        } else if (cfg.gen.dump_logprobs_path) {
+            if (cfg.gen.prompt == NULL) {
+                fprintf(stderr, "ds4: Qwen logprobs dump requires -p/--prompt\n");
+                rc = 2;
+            } else {
+                ds4_tokens qwen_prompt = {0};
+                build_prompt(engine, &cfg.gen, &qwen_prompt);
+                rc = run_logprob_dump(engine, &cfg, &qwen_prompt);
+                ds4_tokens_free(&qwen_prompt);
+            }
+        } else if (cfg.gen.prompt == NULL) {
+            fprintf(stderr, "ds4: Qwen compatibility backend currently supports one-shot -p/--prompt runs\n");
+            rc = 2;
+        } else if (qwen_compat_generation_enabled()) {
+            rc = run_qwen_compat_generation(engine, &cfg);
+        } else {
+            rc = run_generation(engine, &cfg);
+        }
     } else if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,
                                         cfg.gen.imatrix_dataset_path,

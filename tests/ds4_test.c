@@ -1599,6 +1599,10 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_qwen_arch_aliases(void) {
+    TEST_ASSERT(ds4_qwen_arch_alias_self_test(stderr));
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -1618,6 +1622,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
+    {"--qwen-arch-aliases", "qwen-arch-aliases", "Qwen3.5/Qwen3.6 architecture alias mapping", test_qwen_arch_aliases},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

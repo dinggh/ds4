@@ -14,5 +14,7 @@
 __pycache__/
 *.pyc
 /misc/
+/third_party/llama.cpp-bin/
+.env_host
 .*.swp
 .DS_Store

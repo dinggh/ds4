@@ -34,7 +34,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression qwen-arch-aliases-smoke qwen-smoke qwen-variants-smoke qwen-bench qwen-bench-threshold-smoke qwen-bench-smoke qwen-check
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -198,6 +198,26 @@ endif
 test: ds4_test ds4-eval
 	./ds4-eval --self-test-extractors
 	./ds4_test
+
+qwen-arch-aliases-smoke: ds4_test
+	./ds4_test --qwen-arch-aliases
+
+qwen-smoke: ds4
+	tests/qwen35_gguf_smoke.sh
+
+qwen-variants-smoke: ds4
+	tests/qwen35_variants_smoke.sh
+
+qwen-bench: ds4
+	scripts/qwen35_bench.sh
+
+qwen-bench-threshold-smoke: ds4
+	tests/qwen35_bench_threshold_smoke.sh
+
+qwen-bench-smoke: ds4-bench
+	tests/qwen35_bench_snapshot_smoke.sh
+
+qwen-check: qwen-arch-aliases-smoke qwen-smoke qwen-variants-smoke qwen-bench-threshold-smoke qwen-bench-smoke
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
