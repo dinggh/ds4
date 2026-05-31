@@ -2269,6 +2269,82 @@ typedef struct {
     int8_t *q8_xq;
     float *q8_xscale;
     uint64_t q8_blocks_cap;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    ds4_gpu_tensor *gpu_norm;
+    ds4_gpu_tensor *gpu_logits;
+    ds4_gpu_tensor *gpu_argmax_idx;
+    ds4_gpu_tensor *gpu_cur;
+    ds4_gpu_tensor *gpu_next;
+    ds4_gpu_tensor *gpu_attn;
+    ds4_gpu_tensor *gpu_after_attn;
+    ds4_gpu_tensor *gpu_ffn;
+    ds4_gpu_tensor *gpu_mat_in;
+    ds4_gpu_tensor *gpu_mat_out;
+    ds4_gpu_tensor *gpu_mat_q8;
+    ds4_gpu_tensor *gpu_ffn_gate;
+    ds4_gpu_tensor *gpu_ffn_up;
+    ds4_gpu_tensor *gpu_ffn_mid;
+    ds4_gpu_tensor *gpu_layer_qkv;
+    ds4_gpu_tensor *gpu_layer_z;
+    ds4_gpu_tensor *gpu_layer_beta;
+    ds4_gpu_tensor *gpu_layer_alpha;
+    ds4_gpu_tensor *gpu_layer_gated;
+    ds4_gpu_tensor *gpu_full_qg;
+    ds4_gpu_tensor *gpu_full_k;
+    ds4_gpu_tensor *gpu_full_v;
+    ds4_gpu_tensor *gpu_full_heads;
+    ds4_gpu_tensor *gpu_full_kv;
+    ds4_gpu_tensor *gpu_gdn_state;
+    ds4_gpu_tensor *gpu_gdn_conv;
+    uint64_t gpu_norm_bytes;
+    uint64_t gpu_logits_bytes;
+    uint64_t gpu_argmax_idx_bytes;
+    uint64_t gpu_cur_bytes;
+    uint64_t gpu_next_bytes;
+    uint64_t gpu_attn_bytes;
+    uint64_t gpu_after_attn_bytes;
+    uint64_t gpu_ffn_bytes;
+    uint64_t gpu_mat_in_bytes;
+    uint64_t gpu_mat_out_bytes;
+    uint64_t gpu_mat_q8_bytes;
+    uint64_t gpu_ffn_gate_bytes;
+    uint64_t gpu_ffn_up_bytes;
+    uint64_t gpu_ffn_mid_bytes;
+    uint64_t gpu_layer_qkv_bytes;
+    uint64_t gpu_layer_z_bytes;
+    uint64_t gpu_layer_beta_bytes;
+    uint64_t gpu_layer_alpha_bytes;
+    uint64_t gpu_layer_gated_bytes;
+    uint64_t gpu_full_qg_bytes;
+    uint64_t gpu_full_k_bytes;
+    uint64_t gpu_full_v_bytes;
+    uint64_t gpu_full_heads_bytes;
+    uint64_t gpu_full_kv_bytes;
+    uint64_t gpu_gdn_state_bytes;
+    uint64_t gpu_gdn_conv_bytes;
+    int gpu_gdn_ready;
+    int gpu_full_kv_ready;
+    uint64_t gpu_mat_calls;
+    uint64_t gpu_mat_eligible;
+    uint64_t gpu_mat_attempts;
+    uint64_t gpu_mat_fallbacks;
+    uint64_t gpu_mat_f32_calls;
+    uint64_t gpu_mat_q3_calls;
+    uint64_t gpu_mat_q5_calls;
+    uint64_t gpu_mat_q6_calls;
+    uint64_t gpu_mat_q4_1_calls;
+    uint64_t gpu_mat_iq4_nl_calls;
+    uint64_t gpu_mat_q3_eligible;
+    uint64_t gpu_mat_q6_eligible;
+    uint64_t gpu_mat_q4_1_eligible;
+    uint64_t gpu_mat_iq4_nl_eligible;
+    uint64_t gpu_mat_no_cuda_cond;
+    uint64_t gpu_mat_in_bytes_total;
+    uint64_t gpu_mat_out_bytes_total;
+    double gpu_mat_write_sec;
+    double gpu_mat_kernel_sec;
+    double gpu_mat_read_sec;
+#endif
     int ctx_size;
 } qwen35_native_state;
 
@@ -17617,7 +17693,7 @@ static int generate_raw_swa_cpu(
             free(logits);
             cpu_decode_scratch_free(&decode_scratch);
             kv_cache_free(&cache);
-            return 1;
+            return -1;
         }
         fprintf(stderr, "ds4: wrote CPU prefill logits to %s\n", dump_prefill_logits);
     }
@@ -17705,7 +17781,7 @@ static int generate_metal_graph_raw_swa(
 
     if (prompt->len <= 0 || prompt->len > ctx_size) {
         fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
-        return 1;
+        return -1;
     }
 
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(prompt->len);
@@ -17721,7 +17797,7 @@ static int generate_metal_graph_raw_swa(
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
-        return 1;
+        return -1;
     }
     g.quality = quality;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
@@ -17730,7 +17806,7 @@ static int generate_metal_graph_raw_swa(
                                                directional_steering_attn,
                                                directional_steering_ffn)) {
         metal_graph_free(&g);
-        return 1;
+        return -1;
     }
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
@@ -17979,6 +18055,9 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool logits_argmax_valid;
+    bool logits_stale;
+    int logits_argmax_token;
 };
 
 /* =========================================================================
@@ -18297,7 +18376,7 @@ static uint64_t qwen35_session_live_full_kv_bytes(const ds4_session *s) {
 static uint64_t qwen35_session_payload_bytes(ds4_session *s) {
     if (!ds4_session_is_qwen(s) || !s->checkpoint_valid) return 0;
     const qwen35_config *q = &s->engine->qwen_config;
-    const qwen35_native_state *st = &s->qwen_state;
+    qwen35_native_state *st = &s->qwen_state;
     uint64_t bytes = (uint64_t)DS4_QWEN_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
     bytes += (uint64_t)q->n_vocab * sizeof(float);
@@ -18347,6 +18426,16 @@ static int qwen35_session_write_payload(ds4_session *s, FILE *fp, char *err, siz
         payload_set_err(err, errlen, "Qwen full-attention KV dimension is too large to snapshot");
         return 1;
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (st->gpu_full_kv_ready && st->gpu_full_kv && st->plan.full_attn_kv_f16_bytes_total &&
+        !ds4_gpu_tensor_read(st->gpu_full_kv,
+                             0,
+                             st->full_attn_kv,
+                             st->plan.full_attn_kv_f16_bytes_total)) {
+        payload_set_err(err, errlen, "failed to synchronize Qwen CUDA full-attention KV before snapshot");
+        return 1;
+    }
+#endif
     for (uint32_t i = 0; i < DS4_QWEN_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
     }
@@ -18491,6 +18580,9 @@ static int qwen35_session_load_payload(ds4_session *s,
             return 1;
         }
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    st->gpu_full_kv_ready = 0;
+#endif
     if (payload_read_bytes(fp,
                            st->mtp_hidden,
                            (uint64_t)q->n_embd * sizeof(float),
@@ -20195,6 +20287,34 @@ static void *qwen35_checked_calloc_bytes(uint64_t bytes, const char *name) {
 
 static void qwen35_native_state_free(qwen35_native_state *st) {
     if (!st) return;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    ds4_gpu_tensor_free(st->gpu_gdn_conv);
+    ds4_gpu_tensor_free(st->gpu_gdn_state);
+    ds4_gpu_tensor_free(st->gpu_layer_gated);
+    ds4_gpu_tensor_free(st->gpu_layer_alpha);
+    ds4_gpu_tensor_free(st->gpu_layer_beta);
+    ds4_gpu_tensor_free(st->gpu_layer_z);
+    ds4_gpu_tensor_free(st->gpu_layer_qkv);
+    ds4_gpu_tensor_free(st->gpu_full_kv);
+    ds4_gpu_tensor_free(st->gpu_full_heads);
+    ds4_gpu_tensor_free(st->gpu_full_v);
+    ds4_gpu_tensor_free(st->gpu_full_k);
+    ds4_gpu_tensor_free(st->gpu_full_qg);
+    ds4_gpu_tensor_free(st->gpu_ffn_mid);
+    ds4_gpu_tensor_free(st->gpu_ffn_up);
+    ds4_gpu_tensor_free(st->gpu_ffn_gate);
+    ds4_gpu_tensor_free(st->gpu_mat_q8);
+    ds4_gpu_tensor_free(st->gpu_mat_out);
+    ds4_gpu_tensor_free(st->gpu_mat_in);
+    ds4_gpu_tensor_free(st->gpu_ffn);
+    ds4_gpu_tensor_free(st->gpu_after_attn);
+    ds4_gpu_tensor_free(st->gpu_attn);
+    ds4_gpu_tensor_free(st->gpu_next);
+    ds4_gpu_tensor_free(st->gpu_cur);
+    ds4_gpu_tensor_free(st->gpu_argmax_idx);
+    ds4_gpu_tensor_free(st->gpu_logits);
+    ds4_gpu_tensor_free(st->gpu_norm);
+#endif
     free(st->full_scores);
     free(st->full_heads);
     free(st->full_v);
@@ -20238,6 +20358,13 @@ static void qwen35_native_state_reset(qwen35_native_state *st) {
     if (st->gdn_state) memset(st->gdn_state, 0, (size_t)st->plan.gdn_state_f32_bytes_total);
     if (st->gdn_conv) memset(st->gdn_conv, 0, (size_t)st->plan.gdn_conv_f32_bytes_total);
     if (st->full_attn_kv) memset(st->full_attn_kv, 0, (size_t)st->plan.full_attn_kv_f16_bytes_total);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (st->gpu_gdn_state) ds4_gpu_tensor_fill_f32(st->gpu_gdn_state, 0.0f, st->plan.gdn_state_f32_bytes_total / sizeof(float));
+    if (st->gpu_gdn_conv) ds4_gpu_tensor_fill_f32(st->gpu_gdn_conv, 0.0f, st->plan.gdn_conv_f32_bytes_total / sizeof(float));
+    if (st->gpu_full_kv) ds4_gpu_tensor_fill_f32(st->gpu_full_kv, 0.0f, st->gpu_full_kv_bytes / sizeof(float));
+    st->gpu_gdn_ready = 0;
+    st->gpu_full_kv_ready = 0;
+#endif
 }
 
 static int qwen35_native_state_alloc(qwen35_native_state *st, const qwen35_config *q, int ctx_size) {
@@ -21750,12 +21877,1189 @@ static int qwen35_q8_activation_buffers(qwen35_native_state *scratch,
     return 0;
 }
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+static int qwen35_gpu_tensor_ensure(ds4_gpu_tensor **slot, uint64_t *cap, uint64_t bytes) {
+    if (!slot || !cap || bytes == 0) return 0;
+    if (*slot && *cap >= bytes) return 1;
+    ds4_gpu_tensor_free(*slot);
+    *slot = ds4_gpu_tensor_alloc(bytes);
+    *cap = *slot ? bytes : 0;
+    return *slot != NULL;
+}
+
+static bool qwen35_cuda_matvec_supported_type(uint32_t type) {
+    return type == DS4_TENSOR_F32 ||
+           type == DS4_TENSOR_Q3_K ||
+           type == DS4_TENSOR_Q5_K ||
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_Q4_1 ||
+           type == DS4_TENSOR_IQ4_NL;
+}
+
+static bool qwen35_tensor_name_contains(const ds4_tensor *w, const char *needle) {
+    if (!w || !needle) return false;
+    const size_t n = strlen(needle);
+    return n > 0 && w->name.len >= n && memmem(w->name.ptr, w->name.len, needle, n) != NULL;
+}
+
+static bool qwen35_cuda_q4_1_q8v_enabled_for(const ds4_tensor *w) {
+    if (!w || w->type != DS4_TENSOR_Q4_1 || (w->dim[0] % 32u) != 0) return false;
+    if (getenv("DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V") != NULL) return true;
+    if (getenv("DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V_FFN_GATEUP") != NULL &&
+        (qwen35_tensor_name_contains(w, ".ffn_gate.weight") ||
+         qwen35_tensor_name_contains(w, ".ffn_up.weight"))) {
+        return true;
+    }
+    if (getenv("DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V_FFN_DOWN") != NULL &&
+        qwen35_tensor_name_contains(w, ".ffn_down.weight")) {
+        return true;
+    }
+    if (getenv("DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V_FFN") == NULL) return false;
+    return qwen35_tensor_name_contains(w, ".ffn_gate.weight") ||
+           qwen35_tensor_name_contains(w, ".ffn_up.weight") ||
+           qwen35_tensor_name_contains(w, ".ffn_down.weight");
+}
+
+static int qwen35_cuda_matvec_device(ds4_engine *e,
+                                     qwen35_native_state *scratch,
+                                     ds4_gpu_tensor *out,
+                                     const ds4_tensor *w,
+                                     const ds4_gpu_tensor *x) {
+    if (!e || !scratch || !out || !w || !x || w->ndim != 2) return 0;
+    if (!qwen35_cuda_matvec_supported_type(w->type)) return 0;
+    const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+    int ok = 0;
+    if (w->type == DS4_TENSOR_F32) {
+        ok = ds4_gpu_matmul_f32_qwen_tensor(out, e->model.map, e->model.size,
+                                            w->abs_offset, w->dim[0], w->dim[1], x);
+    } else if (w->type == DS4_TENSOR_Q3_K) {
+        ok = ds4_gpu_matmul_q3_k_tensor(out, e->model.map, e->model.size,
+                                        w->abs_offset, w->dim[0], w->dim[1], x);
+    } else if (w->type == DS4_TENSOR_Q5_K) {
+        ok = ds4_gpu_matmul_q5_k_tensor(out, e->model.map, e->model.size,
+                                        w->abs_offset, w->dim[0], w->dim[1], x);
+    } else if (w->type == DS4_TENSOR_Q6_K) {
+        ok = ds4_gpu_matmul_q6_k_tensor(out, e->model.map, e->model.size,
+                                        w->abs_offset, w->dim[0], w->dim[1], x);
+    } else if (w->type == DS4_TENSOR_Q4_1) {
+        if (qwen35_cuda_q4_1_q8v_enabled_for(w)) {
+            const uint64_t q8_bytes = (w->dim[0] / 32u) * 36u;
+            if (qwen35_gpu_tensor_ensure(&scratch->gpu_mat_q8,
+                                         &scratch->gpu_mat_q8_bytes,
+                                         q8_bytes) &&
+                ds4_gpu_quantize_q8_1_tensor(scratch->gpu_mat_q8, x, w->dim[0])) {
+                ok = ds4_gpu_matmul_q4_1_q8_1_tensor(out, e->model.map, e->model.size,
+                                                      w->abs_offset, w->dim[0], w->dim[1],
+                                                      scratch->gpu_mat_q8);
+            }
+        } else {
+            ok = ds4_gpu_matmul_q4_1_tensor(out, e->model.map, e->model.size,
+                                            w->abs_offset, w->dim[0], w->dim[1], x);
+        }
+    } else if (w->type == DS4_TENSOR_IQ4_NL) {
+        ok = ds4_gpu_matmul_iq4_nl_tensor(out, e->model.map, e->model.size,
+                                          w->abs_offset, w->dim[0], w->dim[1], x);
+    }
+    if (profile) {
+        const double t1 = now_sec();
+        scratch->gpu_mat_attempts++;
+        if (ok) {
+            scratch->gpu_mat_calls++;
+            if (w->type == DS4_TENSOR_F32) scratch->gpu_mat_f32_calls++;
+            if (w->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_calls++;
+            if (w->type == DS4_TENSOR_Q5_K) scratch->gpu_mat_q5_calls++;
+            if (w->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_calls++;
+            if (w->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_calls++;
+            if (w->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_calls++;
+            scratch->gpu_mat_kernel_sec += t1 - t0;
+        } else {
+            scratch->gpu_mat_fallbacks++;
+        }
+    }
+    return ok;
+}
+
+static int qwen35_cuda_matvec_f32_pair_device(ds4_engine *e,
+                                              qwen35_native_state *scratch,
+                                              ds4_gpu_tensor *out_a,
+                                              ds4_gpu_tensor *out_b,
+                                              const ds4_tensor *wa,
+                                              const ds4_tensor *wb,
+                                              const ds4_gpu_tensor *x) {
+    if (!e || !scratch || !out_a || !out_b || !wa || !wb || !x ||
+        getenv("DS4_QWEN_DISABLE_CUDA_GDN_BETA_ALPHA_PAIR") != NULL ||
+        wa->type != DS4_TENSOR_F32 || wb->type != DS4_TENSOR_F32 ||
+        wa->ndim != 2 || wb->ndim != 2 ||
+        wa->dim[0] != wb->dim[0] || wa->dim[1] != wb->dim[1]) {
+        return 0;
+    }
+    const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+    const int ok = ds4_gpu_matmul_f32_qwen_pair_tensor(out_a,
+                                                       out_b,
+                                                       e->model.map,
+                                                       e->model.size,
+                                                       wa->abs_offset,
+                                                       wb->abs_offset,
+                                                       wa->dim[0],
+                                                       wa->dim[1],
+                                                       x);
+    if (profile) {
+        scratch->gpu_mat_attempts += 2;
+        if (ok) {
+            scratch->gpu_mat_calls += 2;
+            scratch->gpu_mat_f32_calls += 2;
+            scratch->gpu_mat_kernel_sec += now_sec() - t0;
+        } else {
+            scratch->gpu_mat_fallbacks += 2;
+        }
+    }
+    return ok;
+}
+
+static int qwen35_cuda_matvec_q4_1_pair_device(ds4_engine *e,
+                                               qwen35_native_state *scratch,
+                                               ds4_gpu_tensor *out_a,
+                                               ds4_gpu_tensor *out_b,
+                                               const ds4_tensor *wa,
+                                               const ds4_tensor *wb,
+                                               const ds4_gpu_tensor *x) {
+    if (!e || !scratch || !out_a || !out_b || !wa || !wb || !x ||
+        getenv("DS4_QWEN_DISABLE_CUDA_FULL_KV_PAIR") != NULL ||
+        getenv("DS4_QWEN_ENABLE_CUDA_Q4_1_HALF16") != NULL ||
+        getenv("DS4_QWEN_DISABLE_CUDA_Q4_1_STRIPED_F32") != NULL ||
+        wa->type != DS4_TENSOR_Q4_1 || wb->type != DS4_TENSOR_Q4_1 ||
+        qwen35_cuda_q4_1_q8v_enabled_for(wa) ||
+        qwen35_cuda_q4_1_q8v_enabled_for(wb) ||
+        wa->ndim != 2 || wb->ndim != 2 ||
+        wa->dim[0] != wb->dim[0] || wa->dim[1] != wb->dim[1]) {
+        return 0;
+    }
+    const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+    const int ok = ds4_gpu_matmul_q4_1_pair_tensor(out_a,
+                                                   out_b,
+                                                   e->model.map,
+                                                   e->model.size,
+                                                   wa->abs_offset,
+                                                   wb->abs_offset,
+                                                   wa->dim[0],
+                                                   wa->dim[1],
+                                                   x);
+    if (profile) {
+        scratch->gpu_mat_attempts += 2;
+        if (ok) {
+            scratch->gpu_mat_calls += 2;
+            scratch->gpu_mat_q4_1_calls += 2;
+            scratch->gpu_mat_kernel_sec += now_sec() - t0;
+        } else {
+            scratch->gpu_mat_fallbacks += 2;
+        }
+    }
+    return ok;
+}
+
+static int qwen35_cuda_full_qkv_q4_1_device(ds4_engine *e,
+                                            qwen35_native_state *scratch,
+                                            ds4_gpu_tensor *out_q,
+                                            ds4_gpu_tensor *out_k,
+                                            ds4_gpu_tensor *out_v,
+                                            const ds4_tensor *wq,
+                                            const ds4_tensor *wk,
+                                            const ds4_tensor *wv,
+                                            const ds4_gpu_tensor *x) {
+    if (!e || !scratch || !out_q || !out_k || !out_v || !wq || !wk || !wv || !x ||
+        getenv("DS4_QWEN_DISABLE_CUDA_FULL_QKV_TRIPLE") != NULL ||
+        getenv("DS4_QWEN_ENABLE_CUDA_Q4_1_HALF16") != NULL ||
+        getenv("DS4_QWEN_DISABLE_CUDA_Q4_1_STRIPED_F32") != NULL ||
+        wq->type != DS4_TENSOR_Q4_1 || wk->type != DS4_TENSOR_Q4_1 || wv->type != DS4_TENSOR_Q4_1 ||
+        qwen35_cuda_q4_1_q8v_enabled_for(wq) ||
+        qwen35_cuda_q4_1_q8v_enabled_for(wk) ||
+        qwen35_cuda_q4_1_q8v_enabled_for(wv) ||
+        wq->ndim != 2 || wk->ndim != 2 || wv->ndim != 2 ||
+        wq->dim[0] != wk->dim[0] || wq->dim[0] != wv->dim[0] ||
+        wk->dim[1] != wv->dim[1] || wk->dim[1] > wq->dim[1]) {
+        return 0;
+    }
+    const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+    const int ok = ds4_gpu_matmul_q4_1_full_qkv_tensor(out_q,
+                                                       out_k,
+                                                       out_v,
+                                                       e->model.map,
+                                                       e->model.size,
+                                                       wq->abs_offset,
+                                                       wk->abs_offset,
+                                                       wv->abs_offset,
+                                                       wq->dim[0],
+                                                       wq->dim[1],
+                                                       wk->dim[1],
+                                                       x);
+    if (profile) {
+        scratch->gpu_mat_attempts += 3;
+        if (ok) {
+            scratch->gpu_mat_calls += 3;
+            scratch->gpu_mat_q4_1_calls += 3;
+            scratch->gpu_mat_kernel_sec += now_sec() - t0;
+        } else {
+            scratch->gpu_mat_fallbacks += 3;
+        }
+    }
+    return ok;
+}
+
+static int qwen35_cuda_gdn_step_out(ds4_engine *e,
+                                    qwen35_native_state *scratch,
+                                    const qwen35_layer_weights *l,
+                                    const float *norm,
+                                    uint64_t conv_offset_bytes,
+                                    uint64_t state_offset_bytes,
+                                    float *out,
+                                    uint32_t n_head,
+                                    uint32_t n_group,
+                                    uint32_t state_dim,
+                                    uint32_t value_head_dim,
+                                    uint32_t kernel,
+                                    uint64_t qkv_dim,
+                                    uint64_t value_dim) {
+    if (!e || !scratch || !l || !norm || !out) return 0;
+    if (getenv("DS4_QWEN_DISABLE_CUDA_GDN") != NULL) return 0;
+    if (!qwen35_cuda_matvec_supported_type(l->attn_qkv->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_gate->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ssm_beta->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ssm_alpha->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ssm_out->type)) {
+        return 0;
+    }
+    const uint64_t norm_bytes = (uint64_t)e->qwen_config.n_embd * sizeof(float);
+    const uint64_t qkv_bytes = qkv_dim * sizeof(float);
+    const uint64_t value_bytes = value_dim * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_head * sizeof(float);
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_qkv, &scratch->gpu_layer_qkv_bytes, qkv_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_z, &scratch->gpu_layer_z_bytes, value_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_beta, &scratch->gpu_layer_beta_bytes, head_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_alpha, &scratch->gpu_layer_alpha_bytes, head_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_gated, &scratch->gpu_layer_gated_bytes, value_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_mat_out, &scratch->gpu_mat_out_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_gdn_state, &scratch->gpu_gdn_state_bytes, scratch->plan.gdn_state_f32_bytes_total) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_gdn_conv, &scratch->gpu_gdn_conv_bytes, scratch->plan.gdn_conv_f32_bytes_total)) {
+        return 0;
+    }
+    if (!scratch->gpu_gdn_ready) {
+        if (!ds4_gpu_tensor_write(scratch->gpu_gdn_state, 0, scratch->gdn_state, scratch->plan.gdn_state_f32_bytes_total) ||
+            !ds4_gpu_tensor_write(scratch->gpu_gdn_conv, 0, scratch->gdn_conv, scratch->plan.gdn_conv_f32_bytes_total)) {
+            return 0;
+        }
+        scratch->gpu_gdn_ready = 1;
+    }
+
+    const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const double t_write0 = profile ? now_sec() : 0.0;
+    if (!ds4_gpu_tensor_write(scratch->gpu_norm, 0, norm, norm_bytes)) return 0;
+    if (profile) {
+        scratch->gpu_mat_write_sec += now_sec() - t_write0;
+        scratch->gpu_mat_in_bytes_total += norm_bytes;
+        scratch->gpu_mat_eligible += 5;
+        if (l->attn_qkv->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+        if (l->attn_gate->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+        if (l->ssm_beta->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+        if (l->ssm_alpha->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+        if (l->ssm_out->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+        if (l->attn_qkv->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+        if (l->attn_gate->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+        if (l->ssm_beta->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+        if (l->ssm_alpha->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+        if (l->ssm_out->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+        if (l->attn_qkv->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+        if (l->attn_gate->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+        if (l->ssm_beta->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+        if (l->ssm_alpha->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+        if (l->ssm_out->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+        if (l->attn_qkv->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+        if (l->attn_gate->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+        if (l->ssm_beta->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+        if (l->ssm_alpha->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+        if (l->ssm_out->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+    }
+    const double t_kernel0 = profile ? now_sec() : 0.0;
+    int beta_alpha_ok = qwen35_cuda_matvec_f32_pair_device(e,
+                                                           scratch,
+                                                           scratch->gpu_layer_beta,
+                                                           scratch->gpu_layer_alpha,
+                                                           l->ssm_beta,
+                                                           l->ssm_alpha,
+                                                           scratch->gpu_norm);
+    if (!beta_alpha_ok) {
+        beta_alpha_ok =
+            qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_beta, l->ssm_beta, scratch->gpu_norm) &&
+            qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_alpha, l->ssm_alpha, scratch->gpu_norm);
+    }
+    const int ok =
+        qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_qkv, l->attn_qkv, scratch->gpu_norm) &&
+        qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_z, l->attn_gate, scratch->gpu_norm) &&
+        beta_alpha_ok &&
+        ds4_gpu_qwen35_gdn_step_tensor(scratch->gpu_layer_gated,
+                                       scratch->gpu_gdn_state,
+                                       state_offset_bytes,
+                                       scratch->gpu_gdn_conv,
+                                       conv_offset_bytes,
+                                       scratch->gpu_layer_qkv,
+                                       scratch->gpu_layer_z,
+                                       scratch->gpu_layer_beta,
+                                       scratch->gpu_layer_alpha,
+                                       e->model.map,
+                                       e->model.size,
+                                       l->ssm_conv1d->abs_offset,
+                                       l->ssm_dt->abs_offset,
+                                       l->ssm_a->abs_offset,
+                                       l->ssm_norm->abs_offset,
+                                       n_head,
+                                       n_group,
+                                       state_dim,
+                                       value_head_dim,
+                                       kernel,
+                                       e->qwen_config.rms_eps) &&
+        qwen35_cuda_matvec_device(e, scratch, scratch->gpu_mat_out, l->ssm_out, scratch->gpu_layer_gated);
+    if (profile) scratch->gpu_mat_kernel_sec += now_sec() - t_kernel0;
+    if (!ok) return 0;
+    const double t_read0 = profile ? now_sec() : 0.0;
+    if (!ds4_gpu_tensor_read(scratch->gpu_mat_out, 0, out, norm_bytes)) return 0;
+    if (profile) {
+        scratch->gpu_mat_read_sec += now_sec() - t_read0;
+        scratch->gpu_mat_out_bytes_total += norm_bytes;
+    }
+    return 1;
+}
+
+static int qwen35_cuda_full_attn_step_out(ds4_session *s,
+                                          const qwen35_layer_weights *l,
+                                          const float *norm,
+                                          uint32_t full_index,
+                                          uint32_t pos,
+                                          float *out) {
+    if (!s || !s->engine || !l || !norm || !out) return 0;
+    if (getenv("DS4_QWEN_DISABLE_CUDA_FULL_ATTN") != NULL) return 0;
+    ds4_engine *e = s->engine;
+    qwen35_native_state *scratch = &s->qwen_state;
+    if (!(e->backend == DS4_BACKEND_CUDA && e->metal_ready) ||
+        !scratch || !scratch->full_attn_kv ||
+        !qwen35_cuda_matvec_supported_type(l->attn_q->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_k->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_v->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_output->type)) {
+        return 0;
+    }
+    if ((uint32_t)s->ctx_size > 1024u || pos >= (uint32_t)s->ctx_size) return 0;
+    const uint64_t n_embd = e->qwen_config.n_embd;
+    const uint64_t q_dim = (uint64_t)e->qwen_config.n_head * e->qwen_config.head_dim;
+    const uint64_t kv_dim = (uint64_t)e->qwen_config.n_head_kv * e->qwen_config.head_dim;
+    const uint64_t norm_bytes = n_embd * sizeof(float);
+    const uint64_t qg_bytes = 2u * q_dim * sizeof(float);
+    const uint64_t kv_bytes = kv_dim * sizeof(float);
+    const uint64_t heads_bytes = q_dim * sizeof(float);
+    const uint64_t full_kv_bytes = scratch->plan.full_attn_kv_f16_bytes_total;
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_qg, &scratch->gpu_full_qg_bytes, qg_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_k, &scratch->gpu_full_k_bytes, kv_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_v, &scratch->gpu_full_v_bytes, kv_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_heads, &scratch->gpu_full_heads_bytes, heads_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_mat_out, &scratch->gpu_mat_out_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_kv, &scratch->gpu_full_kv_bytes, full_kv_bytes)) {
+        return 0;
+    }
+    if (!scratch->gpu_full_kv_ready) {
+        if (full_kv_bytes &&
+            !ds4_gpu_tensor_write(scratch->gpu_full_kv, 0, scratch->full_attn_kv, full_kv_bytes)) {
+            return 0;
+        }
+        scratch->gpu_full_kv_ready = 1;
+    }
+    const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const double t_write0 = profile ? now_sec() : 0.0;
+    if (!ds4_gpu_tensor_write(scratch->gpu_norm, 0, norm, norm_bytes)) return 0;
+    if (profile) {
+        scratch->gpu_mat_write_sec += now_sec() - t_write0;
+        scratch->gpu_mat_in_bytes_total += norm_bytes;
+    }
+    const double t_kernel0 = profile ? now_sec() : 0.0;
+    const uint64_t kv_offset = (uint64_t)full_index * scratch->plan.full_attn_kv_f16_bytes_per_layer;
+    int qkv_proj_ok = qwen35_cuda_full_qkv_q4_1_device(e,
+                                                       scratch,
+                                                       scratch->gpu_full_qg,
+                                                       scratch->gpu_full_k,
+                                                       scratch->gpu_full_v,
+                                                       l->attn_q,
+                                                       l->attn_k,
+                                                       l->attn_v,
+                                                       scratch->gpu_norm);
+    if (!qkv_proj_ok) {
+        int kv_proj_ok = qwen35_cuda_matvec_q4_1_pair_device(e,
+                                                             scratch,
+                                                             scratch->gpu_full_k,
+                                                             scratch->gpu_full_v,
+                                                             l->attn_k,
+                                                             l->attn_v,
+                                                             scratch->gpu_norm);
+        if (!kv_proj_ok) {
+            kv_proj_ok =
+                qwen35_cuda_matvec_device(e, scratch, scratch->gpu_full_k, l->attn_k, scratch->gpu_norm) &&
+                qwen35_cuda_matvec_device(e, scratch, scratch->gpu_full_v, l->attn_v, scratch->gpu_norm);
+        }
+        qkv_proj_ok =
+            qwen35_cuda_matvec_device(e, scratch, scratch->gpu_full_qg, l->attn_q, scratch->gpu_norm) &&
+            kv_proj_ok;
+    }
+    const int ok =
+        qkv_proj_ok &&
+        ds4_gpu_qwen35_full_attn_step_tensor(scratch->gpu_full_heads,
+                                             scratch->gpu_full_kv,
+                                             kv_offset,
+                                             scratch->gpu_full_qg,
+                                             scratch->gpu_full_k,
+                                             scratch->gpu_full_v,
+                                             e->model.map,
+                                             e->model.size,
+                                             l->attn_q_norm->abs_offset,
+                                             l->attn_k_norm->abs_offset,
+                                             pos,
+                                             (uint32_t)s->ctx_size,
+                                             e->qwen_config.n_head,
+                                             e->qwen_config.n_head_kv,
+                                             e->qwen_config.head_dim,
+                                             e->qwen_config.rope_dim,
+                                             e->qwen_config.rope_section_count,
+                                             e->qwen_config.rope_sections,
+                                             e->qwen_config.rope_freq_base,
+                                             e->qwen_config.rms_eps) &&
+        qwen35_cuda_matvec_device(e, scratch, scratch->gpu_mat_out, l->attn_output, scratch->gpu_full_heads);
+    if (profile) scratch->gpu_mat_kernel_sec += now_sec() - t_kernel0;
+    if (!ok) return 0;
+    if (getenv("DS4_QWEN_SYNC_CUDA_FULL_KV") != NULL && scratch->full_k && scratch->full_v) {
+        const uint64_t layer_values = (uint64_t)s->ctx_size * 2u * kv_dim;
+        uint16_t *kv_cache = (uint16_t *)scratch->full_attn_kv + (uint64_t)full_index * layer_values;
+        uint16_t *k_cache = kv_cache + (uint64_t)pos * 2u * kv_dim;
+        uint16_t *v_cache = k_cache + kv_dim;
+        if (!ds4_gpu_tensor_read(scratch->gpu_full_k, 0, scratch->full_k, kv_bytes) ||
+            !ds4_gpu_tensor_read(scratch->gpu_full_v, 0, scratch->full_v, kv_bytes)) {
+            return 0;
+        }
+        for (uint64_t i = 0; i < kv_dim; i++) {
+            k_cache[i] = f32_to_f16(scratch->full_k[i]);
+            v_cache[i] = f32_to_f16(scratch->full_v[i]);
+        }
+    }
+    const double t_read0 = profile ? now_sec() : 0.0;
+    if (!ds4_gpu_tensor_read(scratch->gpu_mat_out, 0, out, norm_bytes)) return 0;
+    if (profile) {
+        scratch->gpu_mat_read_sec += now_sec() - t_read0;
+        scratch->gpu_mat_out_bytes_total += norm_bytes;
+    }
+    return 1;
+}
+
+static int qwen35_embed_token_to_f32(ds4_engine *e, int token, float *out);
+
+static int qwen35_cuda_gdn_device_out(ds4_session *s,
+                                      const qwen35_layer_weights *l,
+                                      uint32_t recurrent_index,
+                                      const ds4_gpu_tensor *x,
+                                      ds4_gpu_tensor *out) {
+    if (!s || !s->engine || !l || !x || !out) return 0;
+    ds4_engine *e = s->engine;
+    qwen35_native_state *scratch = &s->qwen_state;
+    const uint32_t n_head = e->qwen_config.ssm_dt_rank;
+    const uint32_t n_group = e->qwen_config.ssm_group_count;
+    const uint32_t state_dim = e->qwen_config.ssm_state;
+    const uint32_t value_head_dim = n_head ? e->qwen_config.ssm_inner / n_head : 0;
+    const uint64_t n_embd = e->qwen_config.n_embd;
+    const uint64_t key_dim = (uint64_t)n_group * state_dim;
+    const uint64_t value_dim = e->qwen_config.ssm_inner;
+    const uint64_t qkv_dim = 2u * key_dim + value_dim;
+    const uint64_t norm_bytes = n_embd * sizeof(float);
+    const uint64_t qkv_bytes = qkv_dim * sizeof(float);
+    const uint64_t value_bytes = value_dim * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_head * sizeof(float);
+    if (getenv("DS4_QWEN_DISABLE_CUDA_GDN") != NULL ||
+        n_head == 0 || n_group == 0 || value_head_dim == 0 || e->qwen_config.ssm_inner % n_head != 0 ||
+        n_head % n_group != 0 ||
+        recurrent_index >= e->qwen_config.recurrent_layers ||
+        !qwen35_cuda_matvec_supported_type(l->attn_qkv->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_gate->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ssm_beta->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ssm_alpha->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ssm_out->type)) {
+        return 0;
+    }
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_qkv, &scratch->gpu_layer_qkv_bytes, qkv_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_z, &scratch->gpu_layer_z_bytes, value_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_beta, &scratch->gpu_layer_beta_bytes, head_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_alpha, &scratch->gpu_layer_alpha_bytes, head_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_layer_gated, &scratch->gpu_layer_gated_bytes, value_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_gdn_state, &scratch->gpu_gdn_state_bytes, scratch->plan.gdn_state_f32_bytes_total) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_gdn_conv, &scratch->gpu_gdn_conv_bytes, scratch->plan.gdn_conv_f32_bytes_total)) {
+        return 0;
+    }
+    if (!scratch->gpu_gdn_ready) {
+        if (!ds4_gpu_tensor_write(scratch->gpu_gdn_state, 0, scratch->gdn_state, scratch->plan.gdn_state_f32_bytes_total) ||
+            !ds4_gpu_tensor_write(scratch->gpu_gdn_conv, 0, scratch->gdn_conv, scratch->plan.gdn_conv_f32_bytes_total)) {
+            return 0;
+        }
+        scratch->gpu_gdn_ready = 1;
+    }
+    const uint64_t conv_offset_bytes = (uint64_t)recurrent_index * scratch->plan.gdn_conv_f32_bytes_per_layer;
+    const uint64_t state_offset_bytes = (uint64_t)recurrent_index * scratch->plan.gdn_state_f32_bytes_per_layer;
+    const bool debug = getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG") != NULL;
+    if (!ds4_gpu_rms_norm_weight_tensor(scratch->gpu_norm,
+                                        x,
+                                        e->model.map,
+                                        e->model.size,
+                                        l->attn_norm->abs_offset,
+                                        (uint32_t)n_embd,
+                                        e->qwen_config.rms_eps)) {
+        if (debug) fprintf(stderr, "ds4: qwen cuda resident gdn rms failed\n");
+        return 0;
+    }
+    if (!qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_qkv, l->attn_qkv, scratch->gpu_norm)) {
+        if (debug) fprintf(stderr, "ds4: qwen cuda resident gdn qkv failed type=%s\n", tensor_type_name(l->attn_qkv->type));
+        return 0;
+    }
+    if (!qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_z, l->attn_gate, scratch->gpu_norm)) {
+        if (debug) fprintf(stderr, "ds4: qwen cuda resident gdn gate failed type=%s\n", tensor_type_name(l->attn_gate->type));
+        return 0;
+    }
+    int beta_alpha_ok = qwen35_cuda_matvec_f32_pair_device(e,
+                                                           scratch,
+                                                           scratch->gpu_layer_beta,
+                                                           scratch->gpu_layer_alpha,
+                                                           l->ssm_beta,
+                                                           l->ssm_alpha,
+                                                           scratch->gpu_norm);
+    if (!beta_alpha_ok) {
+        beta_alpha_ok =
+            qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_beta, l->ssm_beta, scratch->gpu_norm) &&
+            qwen35_cuda_matvec_device(e, scratch, scratch->gpu_layer_alpha, l->ssm_alpha, scratch->gpu_norm);
+    }
+    if (!beta_alpha_ok) {
+        if (debug) fprintf(stderr, "ds4: qwen cuda resident gdn beta/alpha failed types=%s/%s\n",
+                           tensor_type_name(l->ssm_beta->type),
+                           tensor_type_name(l->ssm_alpha->type));
+        return 0;
+    }
+    if (!ds4_gpu_qwen35_gdn_step_tensor(scratch->gpu_layer_gated,
+                                        scratch->gpu_gdn_state,
+                                        state_offset_bytes,
+                                        scratch->gpu_gdn_conv,
+                                        conv_offset_bytes,
+                                        scratch->gpu_layer_qkv,
+                                        scratch->gpu_layer_z,
+                                        scratch->gpu_layer_beta,
+                                        scratch->gpu_layer_alpha,
+                                        e->model.map,
+                                        e->model.size,
+                                        l->ssm_conv1d->abs_offset,
+                                        l->ssm_dt->abs_offset,
+                                        l->ssm_a->abs_offset,
+                                        l->ssm_norm->abs_offset,
+                                          n_head,
+                                          n_group,
+                                          state_dim,
+                                          value_head_dim,
+                                        e->qwen_config.ssm_conv_kernel,
+                                        e->qwen_config.rms_eps)) {
+        if (debug) fprintf(stderr, "ds4: qwen cuda resident gdn step failed\n");
+        return 0;
+    }
+    if (!qwen35_cuda_matvec_device(e, scratch, out, l->ssm_out, scratch->gpu_layer_gated)) {
+        if (debug) fprintf(stderr, "ds4: qwen cuda resident gdn out failed type=%s\n", tensor_type_name(l->ssm_out->type));
+        return 0;
+    }
+    return 1;
+}
+
+static int qwen35_cuda_full_attn_device_out(ds4_session *s,
+                                            const qwen35_layer_weights *l,
+                                            uint32_t full_index,
+                                            uint32_t pos,
+                                            const ds4_gpu_tensor *x,
+                                            ds4_gpu_tensor *out) {
+    if (!s || !s->engine || !l || !x || !out) return 0;
+    ds4_engine *e = s->engine;
+    qwen35_native_state *scratch = &s->qwen_state;
+    if (getenv("DS4_QWEN_DISABLE_CUDA_FULL_ATTN") != NULL ||
+        (uint32_t)s->ctx_size > 1024u || pos >= (uint32_t)s->ctx_size ||
+        full_index >= e->qwen_config.full_attention_layers ||
+        !qwen35_cuda_matvec_supported_type(l->attn_q->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_k->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_v->type) ||
+        !qwen35_cuda_matvec_supported_type(l->attn_output->type)) {
+        return 0;
+    }
+    const uint64_t n_embd = e->qwen_config.n_embd;
+    const uint64_t q_dim = (uint64_t)e->qwen_config.n_head * e->qwen_config.head_dim;
+    const uint64_t kv_dim = (uint64_t)e->qwen_config.n_head_kv * e->qwen_config.head_dim;
+    const uint64_t norm_bytes = n_embd * sizeof(float);
+    const uint64_t qg_bytes = 2u * q_dim * sizeof(float);
+    const uint64_t kv_bytes = kv_dim * sizeof(float);
+    const uint64_t heads_bytes = q_dim * sizeof(float);
+    const uint64_t full_kv_bytes = scratch->plan.full_attn_kv_f16_bytes_total;
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_qg, &scratch->gpu_full_qg_bytes, qg_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_k, &scratch->gpu_full_k_bytes, kv_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_v, &scratch->gpu_full_v_bytes, kv_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_heads, &scratch->gpu_full_heads_bytes, heads_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_full_kv, &scratch->gpu_full_kv_bytes, full_kv_bytes)) {
+        return 0;
+    }
+    if (!scratch->gpu_full_kv_ready) {
+        if (full_kv_bytes &&
+            !ds4_gpu_tensor_write(scratch->gpu_full_kv, 0, scratch->full_attn_kv, full_kv_bytes)) {
+            return 0;
+        }
+        scratch->gpu_full_kv_ready = 1;
+    }
+    const uint64_t kv_offset = (uint64_t)full_index * scratch->plan.full_attn_kv_f16_bytes_per_layer;
+    if (!ds4_gpu_rms_norm_weight_tensor(scratch->gpu_norm,
+                                        x,
+                                        e->model.map,
+                                        e->model.size,
+                                        l->attn_norm->abs_offset,
+                                        (uint32_t)n_embd,
+                                        e->qwen_config.rms_eps)) {
+        return 0;
+    }
+    int qkv_proj_ok = qwen35_cuda_full_qkv_q4_1_device(e,
+                                                       scratch,
+                                                       scratch->gpu_full_qg,
+                                                       scratch->gpu_full_k,
+                                                       scratch->gpu_full_v,
+                                                       l->attn_q,
+                                                       l->attn_k,
+                                                       l->attn_v,
+                                                       scratch->gpu_norm);
+    if (!qkv_proj_ok) {
+        int kv_proj_ok = qwen35_cuda_matvec_q4_1_pair_device(e,
+                                                             scratch,
+                                                             scratch->gpu_full_k,
+                                                             scratch->gpu_full_v,
+                                                             l->attn_k,
+                                                             l->attn_v,
+                                                             scratch->gpu_norm);
+        if (!kv_proj_ok) {
+            kv_proj_ok =
+                qwen35_cuda_matvec_device(e, scratch, scratch->gpu_full_k, l->attn_k, scratch->gpu_norm) &&
+                qwen35_cuda_matvec_device(e, scratch, scratch->gpu_full_v, l->attn_v, scratch->gpu_norm);
+        }
+        qkv_proj_ok =
+            qwen35_cuda_matvec_device(e, scratch, scratch->gpu_full_qg, l->attn_q, scratch->gpu_norm) &&
+            kv_proj_ok;
+    }
+    return qkv_proj_ok &&
+           ds4_gpu_qwen35_full_attn_step_tensor(scratch->gpu_full_heads,
+                                                scratch->gpu_full_kv,
+                                                kv_offset,
+                                                scratch->gpu_full_qg,
+                                                scratch->gpu_full_k,
+                                                scratch->gpu_full_v,
+                                                e->model.map,
+                                                e->model.size,
+                                                l->attn_q_norm->abs_offset,
+                                                l->attn_k_norm->abs_offset,
+                                                pos,
+                                                (uint32_t)s->ctx_size,
+                                                e->qwen_config.n_head,
+                                                e->qwen_config.n_head_kv,
+                                                e->qwen_config.head_dim,
+                                                e->qwen_config.rope_dim,
+                                                e->qwen_config.rope_section_count,
+                                                e->qwen_config.rope_sections,
+                                                e->qwen_config.rope_freq_base,
+                                                e->qwen_config.rms_eps) &&
+           qwen35_cuda_matvec_device(e, scratch, out, l->attn_output, scratch->gpu_full_heads);
+}
+
+static int qwen35_cuda_ffn_norm_device_out(ds4_engine *e,
+                                           qwen35_native_state *scratch,
+                                           const qwen35_layer_weights *l,
+                                           const ds4_gpu_tensor *norm,
+                                           ds4_gpu_tensor *out) {
+    if (!e || !scratch || !l || !norm || !out || e->qwen_config.moe) return 0;
+    if (getenv("DS4_QWEN_DISABLE_CUDA_FFN") != NULL ||
+        !l->ffn_gate || !l->ffn_up || !l->ffn_down ||
+        !qwen35_cuda_matvec_supported_type(l->ffn_gate->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ffn_up->type) ||
+        !qwen35_cuda_matvec_supported_type(l->ffn_down->type)) {
+        return 0;
+    }
+    const uint64_t mid_dim = l->ffn_gate->dim[1];
+    if (mid_dim > UINT32_MAX) return 0;
+    const uint64_t mid_bytes = mid_dim * sizeof(float);
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_mid, &scratch->gpu_ffn_mid_bytes, mid_bytes)) {
+        return 0;
+    }
+    if (getenv("DS4_QWEN_ENABLE_CUDA_FFN_PAIR") != NULL &&
+        l->ffn_gate->type == DS4_TENSOR_Q4_1 &&
+        l->ffn_up->type == DS4_TENSOR_Q4_1) {
+        const double t0 = now_sec();
+        if (ds4_gpu_qwen35_gate_up_swiglu_q4_1_tensor(scratch->gpu_ffn_mid,
+                                                       e->model.map,
+                                                       e->model.size,
+                                                       l->ffn_gate->abs_offset,
+                                                       l->ffn_up->abs_offset,
+                                                       l->ffn_gate->dim[0],
+                                                       mid_dim,
+                                                       norm)) {
+            scratch->gpu_mat_attempts += 2;
+            scratch->gpu_mat_calls += 2;
+            scratch->gpu_mat_q4_1_calls += 2;
+            scratch->gpu_mat_kernel_sec += now_sec() - t0;
+            return qwen35_cuda_matvec_device(e, scratch, out, l->ffn_down, scratch->gpu_ffn_mid);
+        }
+    }
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_gate, &scratch->gpu_ffn_gate_bytes, mid_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_up, &scratch->gpu_ffn_up_bytes, mid_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_mid, &scratch->gpu_ffn_mid_bytes, mid_bytes)) {
+        return 0;
+    }
+    return qwen35_cuda_matvec_device(e, scratch, scratch->gpu_ffn_gate, l->ffn_gate, norm) &&
+           qwen35_cuda_matvec_device(e, scratch, scratch->gpu_ffn_up, l->ffn_up, norm) &&
+           ds4_gpu_swiglu_tensor(scratch->gpu_ffn_mid,
+                                 scratch->gpu_ffn_gate,
+                                 scratch->gpu_ffn_up,
+                                 (uint32_t)mid_dim,
+                                 0.0f,
+                                 1.0f) &&
+           qwen35_cuda_matvec_device(e, scratch, out, l->ffn_down, scratch->gpu_ffn_mid);
+}
+
+static int qwen35_cuda_ffn_device_out(ds4_engine *e,
+                                      qwen35_native_state *scratch,
+                                      const qwen35_layer_weights *l,
+                                      const ds4_gpu_tensor *x,
+                                      ds4_gpu_tensor *out) {
+    if (!e || !scratch || !l || !x || !out || e->qwen_config.moe || !l->ffn_norm) return 0;
+    const uint64_t n_embd = e->qwen_config.n_embd;
+    const uint64_t norm_bytes = n_embd * sizeof(float);
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes)) return 0;
+    return ds4_gpu_rms_norm_weight_tensor(scratch->gpu_norm,
+                                          x,
+                                          e->model.map,
+                                          e->model.size,
+                                          l->ffn_norm->abs_offset,
+                                          (uint32_t)n_embd,
+                                          e->qwen_config.rms_eps) &&
+           qwen35_cuda_ffn_norm_device_out(e, scratch, l, scratch->gpu_norm, out);
+}
+
+static int qwen35_cuda_output_logits_device(ds4_session *s,
+                                            const ds4_gpu_tensor *x,
+                                            bool top_only,
+                                            int *top_out) {
+    if (!s || !s->engine || !x) return 0;
+    ds4_engine *e = s->engine;
+    qwen35_native_state *scratch = &s->qwen_state;
+    const ds4_tensor *w = e->qwen_weights.output ? e->qwen_weights.output : e->qwen_weights.token_embd;
+    if (!w || w->ndim != 2 ||
+        w->dim[0] != e->qwen_config.n_embd ||
+        w->dim[1] != e->qwen_config.n_vocab ||
+        !qwen35_cuda_matvec_supported_type(w->type)) {
+        return 0;
+    }
+    const uint64_t norm_bytes = (uint64_t)e->qwen_config.n_embd * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)e->qwen_config.n_vocab * sizeof(float);
+    if (!qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes) ||
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_logits, &scratch->gpu_logits_bytes, logits_bytes)) {
+        return 0;
+    }
+    if (top_only &&
+        !qwen35_gpu_tensor_ensure(&scratch->gpu_argmax_idx,
+                                  &scratch->gpu_argmax_idx_bytes,
+                                  sizeof(int32_t))) {
+        return 0;
+    }
+    if (!ds4_gpu_rms_norm_weight_tensor(scratch->gpu_norm,
+                                        x,
+                                        e->model.map,
+                                        e->model.size,
+                                        e->qwen_weights.output_norm->abs_offset,
+                                        e->qwen_config.n_embd,
+                                        e->qwen_config.rms_eps) ||
+        !qwen35_cuda_matvec_device(e, scratch, scratch->gpu_logits, w, scratch->gpu_norm)) {
+        return 0;
+    }
+    if (top_only) {
+        int32_t top = -1;
+        if (!ds4_gpu_argmax_tensor(scratch->gpu_argmax_idx,
+                                   scratch->gpu_logits,
+                                   e->qwen_config.n_vocab) ||
+            !ds4_gpu_tensor_read(scratch->gpu_argmax_idx, 0, &top, sizeof(top)) ||
+            top < 0) {
+            return 0;
+        }
+        if (top_out) *top_out = (int)top;
+        return 1;
+    }
+    if (!ds4_gpu_tensor_read(scratch->gpu_logits, 0, s->logits, logits_bytes)) return 0;
+    return 1;
+}
+
+static int qwen35_session_eval_main_cuda_dense(ds4_session *s, int token, char *err, size_t errlen) {
+    if (!s || !s->engine || token < 0) return 0;
+    ds4_engine *e = s->engine;
+    qwen35_native_state *st = &s->qwen_state;
+    if (getenv("DS4_QWEN_ENABLE_CUDA_RESIDENT") == NULL ||
+        getenv("DS4_QWEN_DISABLE_CUDA_RESIDENT") != NULL ||
+        e->backend != DS4_BACKEND_CUDA || !e->metal_ready || e->qwen_config.moe) {
+        return 0;
+    }
+    const uint32_t n_main = e->qwen_config.n_layer - e->qwen_config.nextn_predict_layers;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    const uint64_t n_embd = e->qwen_config.n_embd;
+    const uint64_t embd_bytes = n_embd * sizeof(float);
+    if (!n_main || pos >= (uint32_t)s->ctx_size || n_embd > UINT32_MAX ||
+        !st->cur || !st->mtp_hidden) {
+        return 0;
+    }
+    const bool profile = getenv("DS4_QWEN_PROFILE") != NULL ||
+                         getenv("DS4_QWEN_CUDA_RESIDENT_PROFILE") != NULL;
+    const double t_all0 = profile ? now_sec() : 0.0;
+    double t_embed = 0.0;
+    double t_recurrent = 0.0;
+    double t_full = 0.0;
+    double t_residual = 0.0;
+    double t_ffn = 0.0;
+    double t_hidden_read = 0.0;
+    double t_output = 0.0;
+    double t0 = 0.0;
+    int rc = -1;
+    const uint64_t gpu_calls0 = st->gpu_mat_calls;
+    const uint64_t gpu_eligible0 = st->gpu_mat_eligible;
+    const uint64_t gpu_attempts0 = st->gpu_mat_attempts;
+    const uint64_t gpu_fallbacks0 = st->gpu_mat_fallbacks;
+    const uint64_t gpu_f32_calls0 = st->gpu_mat_f32_calls;
+    const uint64_t gpu_q3_calls0 = st->gpu_mat_q3_calls;
+    const uint64_t gpu_q5_calls0 = st->gpu_mat_q5_calls;
+    const uint64_t gpu_q6_calls0 = st->gpu_mat_q6_calls;
+    const uint64_t gpu_q4_1_calls0 = st->gpu_mat_q4_1_calls;
+    const uint64_t gpu_iq4_nl_calls0 = st->gpu_mat_iq4_nl_calls;
+    const uint64_t gpu_q3_eligible0 = st->gpu_mat_q3_eligible;
+    const uint64_t gpu_q6_eligible0 = st->gpu_mat_q6_eligible;
+    const uint64_t gpu_q4_1_eligible0 = st->gpu_mat_q4_1_eligible;
+    const uint64_t gpu_iq4_nl_eligible0 = st->gpu_mat_iq4_nl_eligible;
+    const uint64_t gpu_no_cuda0 = st->gpu_mat_no_cuda_cond;
+    const uint64_t gpu_in_bytes0 = st->gpu_mat_in_bytes_total;
+    const uint64_t gpu_out_bytes0 = st->gpu_mat_out_bytes_total;
+    const double gpu_write0 = st->gpu_mat_write_sec;
+    const double gpu_kernel0 = st->gpu_mat_kernel_sec;
+    const double gpu_read0 = st->gpu_mat_read_sec;
+    if (!qwen35_gpu_tensor_ensure(&st->gpu_cur, &st->gpu_cur_bytes, embd_bytes) ||
+        !qwen35_gpu_tensor_ensure(&st->gpu_next, &st->gpu_next_bytes, embd_bytes) ||
+        !qwen35_gpu_tensor_ensure(&st->gpu_attn, &st->gpu_attn_bytes, embd_bytes) ||
+        !qwen35_gpu_tensor_ensure(&st->gpu_after_attn, &st->gpu_after_attn_bytes, embd_bytes) ||
+        !qwen35_gpu_tensor_ensure(&st->gpu_ffn, &st->gpu_ffn_bytes, embd_bytes)) {
+        rc = 0;
+        goto done;
+    }
+    t0 = profile ? now_sec() : 0.0;
+    if (qwen35_embed_token_to_f32(e, token, st->cur) != 0 ||
+        !ds4_gpu_tensor_write(st->gpu_cur, 0, st->cur, embd_bytes)) {
+        rc = 0;
+        goto done;
+    }
+    if (profile) t_embed += now_sec() - t0;
+    uint32_t recurrent_index = 0;
+    uint32_t full_index = 0;
+    ds4_gpu_tensor *cur = st->gpu_cur;
+    ds4_gpu_tensor *next = st->gpu_next;
+    for (uint32_t il = 0; il < n_main; il++) {
+        const qwen35_layer_weights *l = &e->qwen_weights.layer[il];
+        int ok = 0;
+        if (l->recurrent) {
+            t0 = profile ? now_sec() : 0.0;
+            ok = qwen35_cuda_gdn_device_out(s, l, recurrent_index, cur, st->gpu_attn);
+            if (profile) t_recurrent += now_sec() - t0;
+            if (!ok && getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                fprintf(stderr, "ds4: qwen cuda resident layer %u recurrent failed index=%u\n", il, recurrent_index);
+            }
+            recurrent_index++;
+        } else {
+            t0 = profile ? now_sec() : 0.0;
+            ok = qwen35_cuda_full_attn_device_out(s, l, full_index, pos, cur, st->gpu_attn);
+            if (profile) t_full += now_sec() - t0;
+            if (!ok && getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                fprintf(stderr, "ds4: qwen cuda resident layer %u full-attn failed index=%u\n", il, full_index);
+            }
+            full_index++;
+        }
+        if (!ok) {
+            if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed layer %u", il);
+            goto done;
+        }
+        const bool add_norm_fusion = getenv("DS4_QWEN_ENABLE_CUDA_ADD_RMS_FUSION") != NULL &&
+                                     l->ffn_norm != NULL;
+        if (add_norm_fusion) {
+            t0 = profile ? now_sec() : 0.0;
+            if (!qwen35_gpu_tensor_ensure(&st->gpu_norm, &st->gpu_norm_bytes, embd_bytes) ||
+                !ds4_gpu_add_rms_norm_weight_tensor(st->gpu_after_attn,
+                                                    st->gpu_norm,
+                                                    cur,
+                                                    st->gpu_attn,
+                                                    e->model.map,
+                                                    e->model.size,
+                                                    l->ffn_norm->abs_offset,
+                                                    (uint32_t)n_embd,
+                                                    e->qwen_config.rms_eps)) {
+                if (getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                    fprintf(stderr, "ds4: qwen cuda resident layer %u add+rms fusion failed\n", il);
+                }
+                if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed layer %u", il);
+                goto done;
+            }
+            if (profile) t_residual += now_sec() - t0;
+            t0 = profile ? now_sec() : 0.0;
+            if (!qwen35_cuda_ffn_norm_device_out(e, st, l, st->gpu_norm, st->gpu_ffn)) {
+                if (getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                    fprintf(stderr, "ds4: qwen cuda resident layer %u ffn failed\n", il);
+                }
+                if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed layer %u", il);
+                goto done;
+            }
+            if (profile) t_ffn += now_sec() - t0;
+        } else {
+            t0 = profile ? now_sec() : 0.0;
+            if (!ds4_gpu_add_tensor(st->gpu_after_attn, cur, st->gpu_attn, (uint32_t)n_embd)) {
+                if (getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                    fprintf(stderr, "ds4: qwen cuda resident layer %u residual add failed\n", il);
+                }
+                if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed layer %u", il);
+                goto done;
+            }
+            if (profile) t_residual += now_sec() - t0;
+            t0 = profile ? now_sec() : 0.0;
+            if (!qwen35_cuda_ffn_device_out(e, st, l, st->gpu_after_attn, st->gpu_ffn)) {
+                if (getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                    fprintf(stderr, "ds4: qwen cuda resident layer %u ffn failed\n", il);
+                }
+                if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed layer %u", il);
+                goto done;
+            }
+            if (profile) t_ffn += now_sec() - t0;
+        }
+        t0 = profile ? now_sec() : 0.0;
+        if (!ds4_gpu_add_tensor(next, st->gpu_after_attn, st->gpu_ffn, (uint32_t)n_embd)) {
+            if (getenv("DS4_QWEN_CUDA_RESIDENT_DEBUG")) {
+                fprintf(stderr, "ds4: qwen cuda resident layer %u ffn residual add failed\n", il);
+            }
+            if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed layer %u", il);
+            goto done;
+        }
+        if (profile) t_residual += now_sec() - t0;
+        ds4_gpu_tensor *tmp = cur;
+        cur = next;
+        next = tmp;
+    }
+    if (recurrent_index != e->qwen_config.recurrent_layers ||
+        full_index != e->qwen_config.full_attention_layers) {
+        if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval layer counts do not match metadata");
+        goto done;
+    }
+    const bool top_only = getenv("DS4_QWEN_CUDA_GREEDY_TOP_ONLY") != NULL &&
+                          e->mtp_draft_tokens <= 1 &&
+                          getenv("DS4_MTP_PROBE") == NULL;
+    if (!top_only) {
+        t0 = profile ? now_sec() : 0.0;
+        if (!ds4_gpu_tensor_read(cur, 0, st->mtp_hidden, embd_bytes)) {
+            if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed output");
+            goto done;
+        }
+        if (profile) t_hidden_read += now_sec() - t0;
+    }
+    t0 = profile ? now_sec() : 0.0;
+    int top = -1;
+    if (!qwen35_cuda_output_logits_device(s, cur, top_only, &top)) {
+        if (errlen) snprintf(err, errlen, "Qwen CUDA resident eval failed output");
+        goto done;
+    }
+    if (profile) t_output += now_sec() - t0;
+    s->logits_argmax_valid = top_only && top >= 0;
+    s->logits_stale = top_only;
+    s->logits_argmax_token = top;
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    rc = 1;
+
+done:
+    if (profile) {
+        const double total = now_sec() - t_all0;
+        fprintf(stderr,
+                "ds4: qwen cuda resident profile token=%d pos=%u rc=%d total=%.3f ms embed=%.3f recurrent=%.3f full=%.3f residual=%.3f ffn=%.3f hidden_read=%.3f output=%.3f\n",
+                token,
+                pos,
+                rc,
+                total * 1000.0,
+                t_embed * 1000.0,
+                t_recurrent * 1000.0,
+                t_full * 1000.0,
+                t_residual * 1000.0,
+                t_ffn * 1000.0,
+                t_hidden_read * 1000.0,
+                t_output * 1000.0);
+        if (getenv("DS4_QWEN_CUDA_PROFILE") != NULL) {
+            fprintf(stderr,
+                    "ds4: qwen cuda resident matvec profile token=%d calls=%" PRIu64 " f32=%" PRIu64 " q3=%" PRIu64 " q5=%" PRIu64 " q6=%" PRIu64 " q4_1=%" PRIu64 " iq4_nl=%" PRIu64 " h2d=%.3f ms kernel=%.3f ms d2h=%.3f ms in=%.2f MiB out=%.2f MiB\n",
+                    token,
+                    st->gpu_mat_calls - gpu_calls0,
+                    st->gpu_mat_f32_calls - gpu_f32_calls0,
+                    st->gpu_mat_q3_calls - gpu_q3_calls0,
+                    st->gpu_mat_q5_calls - gpu_q5_calls0,
+                    st->gpu_mat_q6_calls - gpu_q6_calls0,
+                    st->gpu_mat_q4_1_calls - gpu_q4_1_calls0,
+                    st->gpu_mat_iq4_nl_calls - gpu_iq4_nl_calls0,
+                    (st->gpu_mat_write_sec - gpu_write0) * 1000.0,
+                    (st->gpu_mat_kernel_sec - gpu_kernel0) * 1000.0,
+                    (st->gpu_mat_read_sec - gpu_read0) * 1000.0,
+                    (double)(st->gpu_mat_in_bytes_total - gpu_in_bytes0) / 1048576.0,
+                    (double)(st->gpu_mat_out_bytes_total - gpu_out_bytes0) / 1048576.0);
+            fprintf(stderr,
+                    "ds4: qwen cuda resident matvec dispatch token=%d eligible=%" PRIu64 " attempts=%" PRIu64 " fallbacks=%" PRIu64 " q3_eligible=%" PRIu64 " q6_eligible=%" PRIu64 " q4_1_eligible=%" PRIu64 " iq4_nl_eligible=%" PRIu64 " no_cuda_cond=%" PRIu64 "\n",
+                    token,
+                    st->gpu_mat_eligible - gpu_eligible0,
+                    st->gpu_mat_attempts - gpu_attempts0,
+                    st->gpu_mat_fallbacks - gpu_fallbacks0,
+                    st->gpu_mat_q3_eligible - gpu_q3_eligible0,
+                    st->gpu_mat_q6_eligible - gpu_q6_eligible0,
+                    st->gpu_mat_q4_1_eligible - gpu_q4_1_eligible0,
+                    st->gpu_mat_iq4_nl_eligible - gpu_iq4_nl_eligible0,
+                    st->gpu_mat_no_cuda_cond - gpu_no_cuda0);
+        }
+    }
+    return rc;
+}
+#endif
+
 static int qwen35_matvec_dense_any_scratch(float *out,
-                                           const ds4_model *m,
+                                           ds4_engine *e,
                                            const ds4_tensor *w,
                                            const float *x,
                                            qwen35_native_state *scratch) {
-    if (!out || !m || !w || !x || w->ndim != 2) return 1;
+    if (!out || !e || !w || !x || w->ndim != 2) return 1;
+    const ds4_model *m = &e->model;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool profile_gpu = scratch && getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+    const bool gpu_eligible = qwen35_cuda_matvec_supported_type(w->type);
+    if (profile_gpu && gpu_eligible) {
+        scratch->gpu_mat_eligible++;
+        if (w->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+        if (w->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+        if (w->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+        if (w->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+        if (!(e->backend == DS4_BACKEND_CUDA && e->metal_ready)) scratch->gpu_mat_no_cuda_cond++;
+    }
+    if (e->backend == DS4_BACKEND_CUDA && e->metal_ready && scratch && gpu_eligible) {
+        const uint64_t in_bytes = w->dim[0] * sizeof(float);
+        const uint64_t out_bytes = w->dim[1] * sizeof(float);
+        if (profile_gpu) scratch->gpu_mat_attempts++;
+        if (qwen35_gpu_tensor_ensure(&scratch->gpu_mat_in, &scratch->gpu_mat_in_bytes, in_bytes) &&
+            qwen35_gpu_tensor_ensure(&scratch->gpu_mat_out, &scratch->gpu_mat_out_bytes, out_bytes))
+        {
+            const bool profile = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+            const double t_write0 = profile ? now_sec() : 0.0;
+            if (!ds4_gpu_tensor_write(scratch->gpu_mat_in, 0, x, in_bytes)) goto qwen_gpu_matvec_fallback;
+            const double t_kernel0 = profile ? now_sec() : 0.0;
+            int ok = 0;
+            if (w->type == DS4_TENSOR_F32) {
+                ok = ds4_gpu_matmul_f32_qwen_tensor(scratch->gpu_mat_out,
+                                                    e->model.map,
+                                                    e->model.size,
+                                                    w->abs_offset,
+                                                    w->dim[0],
+                                                    w->dim[1],
+                                                    scratch->gpu_mat_in);
+            } else if (w->type == DS4_TENSOR_Q3_K) {
+                ok = ds4_gpu_matmul_q3_k_tensor(scratch->gpu_mat_out,
+                                                e->model.map,
+                                                e->model.size,
+                                                w->abs_offset,
+                                                w->dim[0],
+                                                w->dim[1],
+                                                scratch->gpu_mat_in);
+            } else if (w->type == DS4_TENSOR_Q5_K) {
+                ok = ds4_gpu_matmul_q5_k_tensor(scratch->gpu_mat_out,
+                                                e->model.map,
+                                                e->model.size,
+                                                w->abs_offset,
+                                                w->dim[0],
+                                                w->dim[1],
+                                                scratch->gpu_mat_in);
+            } else if (w->type == DS4_TENSOR_Q6_K) {
+                ok = ds4_gpu_matmul_q6_k_tensor(scratch->gpu_mat_out,
+                                                e->model.map,
+                                                e->model.size,
+                                                w->abs_offset,
+                                                w->dim[0],
+                                                w->dim[1],
+                                                scratch->gpu_mat_in);
+            } else if (w->type == DS4_TENSOR_Q4_1) {
+                if (qwen35_cuda_q4_1_q8v_enabled_for(w)) {
+                    const uint64_t q8_bytes = (w->dim[0] / 32u) * 36u;
+                    if (qwen35_gpu_tensor_ensure(&scratch->gpu_mat_q8,
+                                                 &scratch->gpu_mat_q8_bytes,
+                                                 q8_bytes) &&
+                        ds4_gpu_quantize_q8_1_tensor(scratch->gpu_mat_q8,
+                                                     scratch->gpu_mat_in,
+                                                     w->dim[0])) {
+                        ok = ds4_gpu_matmul_q4_1_q8_1_tensor(scratch->gpu_mat_out,
+                                                             e->model.map,
+                                                             e->model.size,
+                                                             w->abs_offset,
+                                                             w->dim[0],
+                                                             w->dim[1],
+                                                             scratch->gpu_mat_q8);
+                    }
+                } else {
+                    ok = ds4_gpu_matmul_q4_1_tensor(scratch->gpu_mat_out,
+                                                    e->model.map,
+                                                    e->model.size,
+                                                    w->abs_offset,
+                                                    w->dim[0],
+                                                    w->dim[1],
+                                                    scratch->gpu_mat_in);
+                }
+            } else if (w->type == DS4_TENSOR_IQ4_NL) {
+                ok = ds4_gpu_matmul_iq4_nl_tensor(scratch->gpu_mat_out,
+                                                  e->model.map,
+                                                  e->model.size,
+                                                  w->abs_offset,
+                                                  w->dim[0],
+                                                  w->dim[1],
+                                                  scratch->gpu_mat_in);
+            }
+            const double t_read0 = profile ? now_sec() : 0.0;
+            if (!ok || !ds4_gpu_tensor_read(scratch->gpu_mat_out, 0, out, out_bytes)) goto qwen_gpu_matvec_fallback;
+            if (profile) {
+                const double t_done = now_sec();
+                scratch->gpu_mat_calls++;
+                if (w->type == DS4_TENSOR_F32) scratch->gpu_mat_f32_calls++;
+                if (w->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_calls++;
+                if (w->type == DS4_TENSOR_Q5_K) scratch->gpu_mat_q5_calls++;
+                if (w->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_calls++;
+                if (w->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_calls++;
+                if (w->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_calls++;
+                scratch->gpu_mat_in_bytes_total += in_bytes;
+                scratch->gpu_mat_out_bytes_total += out_bytes;
+                scratch->gpu_mat_write_sec += t_kernel0 - t_write0;
+                scratch->gpu_mat_kernel_sec += t_read0 - t_kernel0;
+                scratch->gpu_mat_read_sec += t_done - t_read0;
+            }
+            return 0;
+        }
+        if (profile_gpu) scratch->gpu_mat_fallbacks++;
+    }
+qwen_gpu_matvec_fallback:
+#endif
     if (w->type != DS4_TENSOR_Q8_0) return qwen35_matvec_dense_any(out, m, w, x);
     uint64_t blocks = 0;
     bool owned = false;
@@ -22033,6 +23337,11 @@ static int qwen35_rms_norm_heads_inplace(float *x, const ds4_model *m, const ds4
     return 0;
 }
 
+static uint32_t qwen35_gdn_group_for_head(uint32_t h, uint32_t n_head, uint32_t n_group) {
+    const uint32_t heads_per_group = n_head / n_group;
+    return h / heads_per_group;
+}
+
 static int qwen35_layer0_gdn_zero_out(ds4_engine *e, const float *x, float *out) {
     if (!e || !x || !out) return 1;
     const qwen35_layer_weights *l0 = &e->qwen_weights.layer[0];
@@ -22043,12 +23352,14 @@ static int qwen35_layer0_gdn_zero_out(ds4_engine *e, const float *x, float *out)
     }
 
     const uint32_t n_head = e->qwen_config.ssm_dt_rank;
+    const uint32_t n_group = e->qwen_config.ssm_group_count;
     const uint32_t state_dim = e->qwen_config.ssm_state;
     const uint32_t value_head_dim = e->qwen_config.ssm_inner / e->qwen_config.ssm_dt_rank;
-    const uint64_t key_dim = (uint64_t)e->qwen_config.ssm_group_count * state_dim;
+    const uint64_t key_dim = (uint64_t)n_group * state_dim;
     const uint64_t value_dim = e->qwen_config.ssm_inner;
     const uint64_t qkv_dim = 2u * key_dim + value_dim;
-    if (e->qwen_config.ssm_group_count != n_head ||
+    if (n_group == 0 ||
+        n_head % n_group != 0 ||
         e->qwen_config.ssm_inner % e->qwen_config.ssm_dt_rank != 0 ||
         l0->attn_qkv->dim[1] != qkv_dim ||
         l0->attn_gate->dim[1] != value_dim ||
@@ -22075,9 +23386,9 @@ static int qwen35_layer0_gdn_zero_out(ds4_engine *e, const float *x, float *out)
                                l0->attn_norm,
                                e->qwen_config.n_embd,
                                e->qwen_config.rms_eps) != 0 ||
-        qwen35_matvec_dense_any_scratch(qkv, &e->model, l0->attn_qkv, norm, NULL) != 0 ||
-        qwen35_matvec_dense_any_scratch(z, &e->model, l0->attn_gate, norm, NULL) != 0 ||
-        qwen35_matvec_dense_any_scratch(beta, &e->model, l0->ssm_beta, norm, NULL) != 0)
+        qwen35_matvec_dense_any_scratch(qkv, e, l0->attn_qkv, norm, NULL) != 0 ||
+        qwen35_matvec_dense_any_scratch(z, e, l0->attn_gate, norm, NULL) != 0 ||
+        qwen35_matvec_dense_any_scratch(beta, e, l0->ssm_beta, norm, NULL) != 0)
     {
         rc = 1;
     } else {
@@ -22087,8 +23398,9 @@ static int qwen35_layer0_gdn_zero_out(ds4_engine *e, const float *x, float *out)
         for (uint32_t h = 0; h < n_head; h++) beta[h] = sigmoid_stable(beta[h]);
 
         for (uint32_t h = 0; h < n_head; h++) {
-            float *qh = conv + (uint64_t)h * state_dim;
-            float *kh = conv + key_dim + (uint64_t)h * state_dim;
+            const uint32_t group = qwen35_gdn_group_for_head(h, n_head, n_group);
+            float *qh = conv + (uint64_t)group * state_dim;
+            float *kh = conv + key_dim + (uint64_t)group * state_dim;
             qwen35_l2_norm_inplace(qh, state_dim);
             qwen35_l2_norm_inplace(kh, state_dim);
             double qk = 0.0;
@@ -22107,7 +23419,7 @@ static int qwen35_layer0_gdn_zero_out(ds4_engine *e, const float *x, float *out)
                                         n_head,
                                         value_head_dim,
                                         e->qwen_config.rms_eps) != 0 ||
-            qwen35_matvec_dense_any_scratch(out, &e->model, l0->ssm_out, gated, NULL) != 0)
+            qwen35_matvec_dense_any_scratch(out, e, l0->ssm_out, gated, NULL) != 0)
         {
             rc = 1;
         }
@@ -22151,13 +23463,15 @@ static int qwen35_layer_gdn_step_out(ds4_engine *e, uint32_t il, const float *x,
     }
 
     const uint32_t n_head = e->qwen_config.ssm_dt_rank;
+    const uint32_t n_group = e->qwen_config.ssm_group_count;
     const uint32_t state_dim = e->qwen_config.ssm_state;
     const uint32_t value_head_dim = e->qwen_config.ssm_inner / e->qwen_config.ssm_dt_rank;
-    const uint64_t key_dim = (uint64_t)e->qwen_config.ssm_group_count * state_dim;
+    const uint64_t key_dim = (uint64_t)n_group * state_dim;
     const uint64_t value_dim = e->qwen_config.ssm_inner;
     const uint64_t qkv_dim = 2u * key_dim + value_dim;
     const uint32_t kernel = e->qwen_config.ssm_conv_kernel;
-    if (e->qwen_config.ssm_group_count != n_head ||
+    if (n_group == 0 ||
+        n_head % n_group != 0 ||
         e->qwen_config.ssm_inner % e->qwen_config.ssm_dt_rank != 0 ||
         l->attn_qkv->dim[1] != qkv_dim ||
         l->attn_gate->dim[1] != value_dim ||
@@ -22208,11 +23522,52 @@ static int qwen35_layer_gdn_step_out(ds4_engine *e, uint32_t il, const float *x,
                                &e->model,
                                l->attn_norm,
                                e->qwen_config.n_embd,
-                               e->qwen_config.rms_eps) != 0 ||
-        qwen35_matvec_dense_any_scratch(qkv, &e->model, l->attn_qkv, norm, scratch) != 0 ||
-        qwen35_matvec_dense_any_scratch(z, &e->model, l->attn_gate, norm, scratch) != 0 ||
-        qwen35_matvec_dense_any_scratch(beta, &e->model, l->ssm_beta, norm, scratch) != 0 ||
-        qwen35_matvec_dense_any_scratch(alpha, &e->model, l->ssm_alpha, norm, scratch) != 0)
+                               e->qwen_config.rms_eps) != 0)
+    {
+        if (getenv("DS4_QWEN_GDN_DEBUG")) {
+            fprintf(stderr, "ds4: qwen gdn layer %u norm failed\n", il);
+        }
+        rc = 1;
+        goto done;
+    }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool cuda_gdn_candidate =
+        e->backend == DS4_BACKEND_CUDA &&
+        e->metal_ready &&
+        scratch &&
+        getenv("DS4_QWEN_DISABLE_CUDA_GDN") == NULL &&
+        qwen35_cuda_matvec_supported_type(l->attn_qkv->type) &&
+        qwen35_cuda_matvec_supported_type(l->attn_gate->type) &&
+        qwen35_cuda_matvec_supported_type(l->ssm_beta->type) &&
+        qwen35_cuda_matvec_supported_type(l->ssm_alpha->type) &&
+        qwen35_cuda_matvec_supported_type(l->ssm_out->type);
+    if (cuda_gdn_candidate) {
+        const uint64_t conv_offset_bytes = (uint64_t)((const float *)conv_cache - (const float *)scratch->gdn_conv) * sizeof(float);
+        const uint64_t state_offset_bytes = (uint64_t)((const float *)state - (const float *)scratch->gdn_state) * sizeof(float);
+        if (qwen35_cuda_gdn_step_out(e,
+                                     scratch,
+                                     l,
+                                     norm,
+                                     conv_offset_bytes,
+                                     state_offset_bytes,
+                                     out,
+                                     n_head,
+                                     n_group,
+                                     state_dim,
+                                     value_head_dim,
+                                     kernel,
+                                     qkv_dim,
+                                     value_dim)) {
+            goto done;
+        }
+        rc = 1;
+        goto done;
+    }
+#endif
+    if (qwen35_matvec_dense_any_scratch(qkv, e, l->attn_qkv, norm, scratch) != 0 ||
+        qwen35_matvec_dense_any_scratch(z, e, l->attn_gate, norm, scratch) != 0 ||
+        qwen35_matvec_dense_any_scratch(beta, e, l->ssm_beta, norm, scratch) != 0 ||
+        qwen35_matvec_dense_any_scratch(alpha, e, l->ssm_alpha, norm, scratch) != 0)
     {
         if (getenv("DS4_QWEN_GDN_DEBUG")) {
             fprintf(stderr,
@@ -22248,8 +23603,9 @@ static int qwen35_layer_gdn_step_out(ds4_engine *e, uint32_t il, const float *x,
         }
 
         for (uint32_t h = 0; h < n_head; h++) {
-            float *qh = conv + (uint64_t)h * state_dim;
-            float *kh = conv + key_dim + (uint64_t)h * state_dim;
+            const uint32_t group = qwen35_gdn_group_for_head(h, n_head, n_group);
+            float *qh = conv + (uint64_t)group * state_dim;
+            float *kh = conv + key_dim + (uint64_t)group * state_dim;
             qwen35_l2_norm_inplace(qh, state_dim);
             qwen35_l2_norm_inplace(kh, state_dim);
             float *sh = state + (uint64_t)h * value_head_dim * state_dim;
@@ -22277,7 +23633,7 @@ static int qwen35_layer_gdn_step_out(ds4_engine *e, uint32_t il, const float *x,
                                         n_head,
                                         value_head_dim,
                                         e->qwen_config.rms_eps) != 0 ||
-            qwen35_matvec_dense_any_scratch(out, &e->model, l->ssm_out, gated, scratch) != 0)
+            qwen35_matvec_dense_any_scratch(out, e, l->ssm_out, gated, scratch) != 0)
         {
             if (getenv("DS4_QWEN_GDN_DEBUG")) {
                 fprintf(stderr,
@@ -22289,6 +23645,7 @@ static int qwen35_layer_gdn_step_out(ds4_engine *e, uint32_t il, const float *x,
             rc = 1;
         }
     }
+done:
     if (own_scratch) {
         free(gated);
         free(gdn);
@@ -22356,7 +23713,7 @@ static int qwen35_layer_moe_ffn_out(ds4_engine *e, uint32_t il, const float *x, 
 
     memset(out, 0, (size_t)n_embd * sizeof(out[0]));
     if (qwen35_rms_norm_tensor(norm, x, &e->model, l->ffn_norm, n_embd, q->rms_eps) != 0 ||
-        qwen35_matvec_dense_any_scratch(router_logits, &e->model, l->ffn_gate_inp, norm, scratch) != 0) {
+        qwen35_matvec_dense_any_scratch(router_logits, e, l->ffn_gate_inp, norm, scratch) != 0) {
         rc = 1;
         goto done;
     }
@@ -22414,13 +23771,13 @@ static int qwen35_layer_moe_ffn_out(ds4_engine *e, uint32_t il, const float *x, 
         const uint32_t shared = q->n_ff_shexp;
         float shared_scale = 0.0f;
         if (qwen35_dot_1d_any(&shared_scale, &e->model, l->ffn_gate_inp_shexp, norm, scratch) != 0 ||
-            qwen35_matvec_dense_any_scratch(gate, &e->model, l->ffn_gate_shexp, norm, scratch) != 0 ||
-            qwen35_matvec_dense_any_scratch(up, &e->model, l->ffn_up_shexp, norm, scratch) != 0) {
+            qwen35_matvec_dense_any_scratch(gate, e, l->ffn_gate_shexp, norm, scratch) != 0 ||
+            qwen35_matvec_dense_any_scratch(up, e, l->ffn_up_shexp, norm, scratch) != 0) {
             rc = 1;
             goto done;
         }
         for (uint32_t i = 0; i < shared; i++) mid[i] = silu(gate[i]) * up[i];
-        if (qwen35_matvec_dense_any_scratch(down, &e->model, l->ffn_down_shexp, mid, scratch) != 0) {
+        if (qwen35_matvec_dense_any_scratch(down, e, l->ffn_down_shexp, mid, scratch) != 0) {
             rc = 1;
             goto done;
         }
@@ -22477,20 +23834,82 @@ static int qwen35_layer_ffn_out(ds4_engine *e, uint32_t il, const float *x, floa
                                e->qwen_config.rms_eps) != 0) {
         rc = 1;
     } else {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        if (e->backend == DS4_BACKEND_CUDA &&
+            e->metal_ready &&
+            scratch &&
+            getenv("DS4_QWEN_DISABLE_CUDA_FFN") == NULL &&
+            mid_dim <= UINT32_MAX &&
+            qwen35_cuda_matvec_supported_type(l->ffn_gate->type) &&
+            qwen35_cuda_matvec_supported_type(l->ffn_up->type) &&
+            qwen35_cuda_matvec_supported_type(l->ffn_down->type))
+        {
+            const uint64_t norm_bytes = (uint64_t)e->qwen_config.n_embd * sizeof(float);
+            const uint64_t mid_bytes = mid_dim * sizeof(float);
+            const bool profile_gpu = getenv("DS4_QWEN_CUDA_PROFILE") != NULL;
+            const double t_write0 = profile_gpu ? now_sec() : 0.0;
+            if (qwen35_gpu_tensor_ensure(&scratch->gpu_norm, &scratch->gpu_norm_bytes, norm_bytes) &&
+                qwen35_gpu_tensor_ensure(&scratch->gpu_mat_out, &scratch->gpu_mat_out_bytes, norm_bytes) &&
+                qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_gate, &scratch->gpu_ffn_gate_bytes, mid_bytes) &&
+                qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_up, &scratch->gpu_ffn_up_bytes, mid_bytes) &&
+                qwen35_gpu_tensor_ensure(&scratch->gpu_ffn_mid, &scratch->gpu_ffn_mid_bytes, mid_bytes) &&
+                ds4_gpu_tensor_write(scratch->gpu_norm, 0, norm, norm_bytes))
+            {
+                if (profile_gpu) {
+                    scratch->gpu_mat_write_sec += now_sec() - t_write0;
+                    scratch->gpu_mat_in_bytes_total += norm_bytes;
+                    scratch->gpu_mat_eligible += 3;
+                    if (l->ffn_gate->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+                    if (l->ffn_up->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+                    if (l->ffn_down->type == DS4_TENSOR_Q3_K) scratch->gpu_mat_q3_eligible++;
+                    if (l->ffn_gate->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+                    if (l->ffn_up->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+                    if (l->ffn_down->type == DS4_TENSOR_Q6_K) scratch->gpu_mat_q6_eligible++;
+                    if (l->ffn_gate->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+                    if (l->ffn_up->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+                    if (l->ffn_down->type == DS4_TENSOR_Q4_1) scratch->gpu_mat_q4_1_eligible++;
+                    if (l->ffn_gate->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+                    if (l->ffn_up->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+                    if (l->ffn_down->type == DS4_TENSOR_IQ4_NL) scratch->gpu_mat_iq4_nl_eligible++;
+                }
+                const int ok =
+                    qwen35_cuda_matvec_device(e, scratch, scratch->gpu_ffn_gate, l->ffn_gate, scratch->gpu_norm) &&
+                    qwen35_cuda_matvec_device(e, scratch, scratch->gpu_ffn_up, l->ffn_up, scratch->gpu_norm) &&
+                    ds4_gpu_swiglu_tensor(scratch->gpu_ffn_mid,
+                                          scratch->gpu_ffn_gate,
+                                          scratch->gpu_ffn_up,
+                                          (uint32_t)mid_dim,
+                                          0.0f,
+                                          1.0f) &&
+                    qwen35_cuda_matvec_device(e, scratch, scratch->gpu_mat_out, l->ffn_down, scratch->gpu_ffn_mid);
+                if (ok) {
+                    const double t_read0 = profile_gpu ? now_sec() : 0.0;
+                    if (ds4_gpu_tensor_read(scratch->gpu_mat_out, 0, out, norm_bytes)) {
+                        if (profile_gpu) {
+                            scratch->gpu_mat_read_sec += now_sec() - t_read0;
+                            scratch->gpu_mat_out_bytes_total += norm_bytes;
+                        }
+                        goto done;
+                    }
+                }
+            }
+            if (profile_gpu) scratch->gpu_mat_fallbacks++;
+        }
+#endif
         if (qwen35_fast_dot_enabled() &&
             l->ffn_gate->type == DS4_TENSOR_Q2_K &&
             l->ffn_up->type == DS4_TENSOR_Q2_K &&
             qwen35_matvec_q2_k_pair_q8_fast(gate, up, &e->model, l->ffn_gate, l->ffn_up, norm) == 0)
         {
             /* gate/up filled by pair fast path */
-        } else if (qwen35_matvec_dense_any_scratch(gate, &e->model, l->ffn_gate, norm, scratch) != 0 ||
-                   qwen35_matvec_dense_any_scratch(up, &e->model, l->ffn_up, norm, scratch) != 0)
+        } else if (qwen35_matvec_dense_any_scratch(gate, e, l->ffn_gate, norm, scratch) != 0 ||
+                   qwen35_matvec_dense_any_scratch(up, e, l->ffn_up, norm, scratch) != 0)
         {
             rc = 1;
             goto done;
         }
         for (uint64_t i = 0; i < mid_dim; i++) mid[i] = silu(gate[i]) * up[i];
-        if (qwen35_matvec_dense_any_scratch(out, &e->model, l->ffn_down, mid, scratch) != 0) rc = 1;
+        if (qwen35_matvec_dense_any_scratch(out, e, l->ffn_down, mid, scratch) != 0) rc = 1;
     }
 done:
     if (own_scratch) {
@@ -22542,9 +23961,9 @@ static int qwen35_layer_full_attn_self_out_scratch(ds4_engine *e,
                                l->attn_norm,
                                e->qwen_config.n_embd,
                                e->qwen_config.rms_eps) != 0 ||
-        qwen35_matvec_dense_any_scratch(qg, &e->model, l->attn_q, norm, scratch) != 0 ||
-        qwen35_matvec_dense_any_scratch(k, &e->model, l->attn_k, norm, scratch) != 0 ||
-        qwen35_matvec_dense_any_scratch(v, &e->model, l->attn_v, norm, scratch) != 0 ||
+        qwen35_matvec_dense_any_scratch(qg, e, l->attn_q, norm, scratch) != 0 ||
+        qwen35_matvec_dense_any_scratch(k, e, l->attn_k, norm, scratch) != 0 ||
+        qwen35_matvec_dense_any_scratch(v, e, l->attn_v, norm, scratch) != 0 ||
         qwen35_rms_norm_heads_inplace(qg,
                                       &e->model,
                                       l->attn_q_norm,
@@ -22569,7 +23988,7 @@ static int qwen35_layer_full_attn_self_out_scratch(ds4_engine *e,
                 heads[o] = v[(uint64_t)kvh * e->qwen_config.head_dim + d] * sigmoid_stable(gate[o]);
             }
         }
-        if (qwen35_matvec_dense_any_scratch(out, &e->model, l->attn_output, heads, scratch) != 0) rc = 1;
+        if (qwen35_matvec_dense_any_scratch(out, e, l->attn_output, heads, scratch) != 0) rc = 1;
     }
     if (own_scratch) {
         free(heads);
@@ -22656,9 +24075,19 @@ static int qwen35_layer_full_attn_step_out(ds4_session *s,
                                l->attn_norm,
                                e->qwen_config.n_embd,
                                e->qwen_config.rms_eps) != 0 ||
-        qwen35_matvec_dense_any_scratch(qg, &e->model, l->attn_q, norm, &s->qwen_state) != 0 ||
-        qwen35_matvec_dense_any_scratch(k, &e->model, l->attn_k, norm, &s->qwen_state) != 0 ||
-        qwen35_matvec_dense_any_scratch(v, &e->model, l->attn_v, norm, &s->qwen_state) != 0 ||
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        0)
+    {
+        rc = 1;
+        goto done;
+    }
+    if (qwen35_cuda_full_attn_step_out(s, l, norm, full_index, pos, out)) goto done;
+    s->qwen_state.gpu_full_kv_ready = 0;
+    if (
+#endif
+        qwen35_matvec_dense_any_scratch(qg, e, l->attn_q, norm, &s->qwen_state) != 0 ||
+        qwen35_matvec_dense_any_scratch(k, e, l->attn_k, norm, &s->qwen_state) != 0 ||
+        qwen35_matvec_dense_any_scratch(v, e, l->attn_v, norm, &s->qwen_state) != 0 ||
         qwen35_rms_norm_heads_inplace(qg,
                                       &e->model,
                                       l->attn_q_norm,
@@ -22717,7 +24146,7 @@ static int qwen35_layer_full_attn_step_out(ds4_session *s,
         }
     }
 
-    if (qwen35_matvec_dense_any_scratch(out, &e->model, l->attn_output, heads, &s->qwen_state) != 0) rc = 1;
+    if (qwen35_matvec_dense_any_scratch(out, e, l->attn_output, heads, &s->qwen_state) != 0) rc = 1;
 
 done:
     return rc;
@@ -22727,11 +24156,34 @@ static int qwen35_output_logits(float *logits, ds4_engine *e, const float *x, qw
     if (!logits || !e || !x) return 1;
     if (e->qwen_weights.output) {
         const ds4_tensor *w = e->qwen_weights.output;
-        if (w->type != DS4_TENSOR_Q8_0 || w->ndim != 2 ||
+        if (w->ndim != 2 ||
             w->dim[0] != e->qwen_config.n_embd || w->dim[1] != e->qwen_config.n_vocab) {
             return 1;
         }
-        return qwen35_matvec_dense_any_scratch(logits, &e->model, w, x, scratch);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        if (e->backend == DS4_BACKEND_CUDA && e->metal_ready && scratch && w->type == DS4_TENSOR_Q6_K) {
+            if (!scratch->gpu_norm) {
+                scratch->gpu_norm = ds4_gpu_tensor_alloc((uint64_t)e->qwen_config.n_embd * sizeof(float));
+            }
+            if (!scratch->gpu_logits) {
+                scratch->gpu_logits = ds4_gpu_tensor_alloc((uint64_t)e->qwen_config.n_vocab * sizeof(float));
+            }
+            if (scratch->gpu_norm && scratch->gpu_logits &&
+                ds4_gpu_tensor_write(scratch->gpu_norm, 0, x, (uint64_t)e->qwen_config.n_embd * sizeof(float)) &&
+                ds4_gpu_matmul_q6_k_tensor(scratch->gpu_logits,
+                                           e->model.map,
+                                           e->model.size,
+                                           w->abs_offset,
+                                           e->qwen_config.n_embd,
+                                           e->qwen_config.n_vocab,
+                                           scratch->gpu_norm) &&
+                ds4_gpu_tensor_read(scratch->gpu_logits, 0, logits, (uint64_t)e->qwen_config.n_vocab * sizeof(float)))
+            {
+                return 0;
+            }
+        }
+#endif
+        return qwen35_matvec_dense_any_scratch(logits, e, w, x, scratch);
     }
 
     const ds4_tensor *te = e->qwen_weights.token_embd;
@@ -22740,8 +24192,31 @@ static int qwen35_output_logits(float *logits, ds4_engine *e, const float *x, qw
         return 1;
     }
     if (te->type != DS4_TENSOR_Q6_K) {
-        return qwen35_matvec_dense_any_scratch(logits, &e->model, te, x, scratch);
+        return qwen35_matvec_dense_any_scratch(logits, e, te, x, scratch);
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (e->backend == DS4_BACKEND_CUDA && e->metal_ready && scratch) {
+        if (!scratch->gpu_norm) {
+            scratch->gpu_norm = ds4_gpu_tensor_alloc((uint64_t)e->qwen_config.n_embd * sizeof(float));
+        }
+        if (!scratch->gpu_logits) {
+            scratch->gpu_logits = ds4_gpu_tensor_alloc((uint64_t)e->qwen_config.n_vocab * sizeof(float));
+        }
+        if (scratch->gpu_norm && scratch->gpu_logits &&
+            ds4_gpu_tensor_write(scratch->gpu_norm, 0, x, (uint64_t)e->qwen_config.n_embd * sizeof(float)) &&
+            ds4_gpu_matmul_q6_k_tensor(scratch->gpu_logits,
+                                       e->model.map,
+                                       e->model.size,
+                                       te->abs_offset,
+                                       e->qwen_config.n_embd,
+                                       e->qwen_config.n_vocab,
+                                       scratch->gpu_norm) &&
+            ds4_gpu_tensor_read(scratch->gpu_logits, 0, logits, (uint64_t)e->qwen_config.n_vocab * sizeof(float)))
+        {
+            return 0;
+        }
+    }
+#endif
     if ((e->qwen_config.n_embd % QK_K) != 0) return 1;
     const uint64_t n_embd = e->qwen_config.n_embd;
     const uint64_t row_blocks = n_embd / QK_K;
@@ -22769,7 +24244,7 @@ static int qwen35_output_logits_with_head(float *logits,
         head->dim[1] != e->qwen_config.n_vocab) {
         return 1;
     }
-    return qwen35_matvec_dense_any_scratch(logits, &e->model, head, x, scratch);
+    return qwen35_matvec_dense_any_scratch(logits, e, head, x, scratch);
 }
 
 static int qwen35_mtp_draft_logits(ds4_session *s, int token, float *logits, int *top_out) {
@@ -22804,7 +24279,7 @@ static int qwen35_mtp_draft_logits(ds4_session *s, int token, float *logits, int
     }
     memcpy(cat, en, (size_t)q->n_embd * sizeof(cat[0]));
     memcpy(cat + q->n_embd, hn, (size_t)q->n_embd * sizeof(cat[0]));
-    if (qwen35_matvec_dense_any_scratch(draft, &e->model, l->nextn_eh_proj, cat, st) != 0) {
+    if (qwen35_matvec_dense_any_scratch(draft, e, l->nextn_eh_proj, cat, st) != 0) {
         if (getenv("DS4_QWEN_MTP_DEBUG")) {
             fprintf(stderr,
                     "ds4: qwen mtp draft failed projection type=%s in=%" PRIu64 " out=%" PRIu64 " q8_cap=%" PRIu64 "\n",
@@ -23223,12 +24698,14 @@ int ds4_engine_qwen_gdn_zero_test(ds4_engine *e, int token) {
     }
 
     const uint32_t n_head = e->qwen_config.ssm_dt_rank;
+    const uint32_t n_group = e->qwen_config.ssm_group_count;
     const uint32_t state_dim = e->qwen_config.ssm_state;
     const uint32_t value_head_dim = e->qwen_config.ssm_inner / e->qwen_config.ssm_dt_rank;
-    const uint64_t key_dim = (uint64_t)e->qwen_config.ssm_group_count * state_dim;
+    const uint64_t key_dim = (uint64_t)n_group * state_dim;
     const uint64_t value_dim = e->qwen_config.ssm_inner;
     const uint64_t qkv_dim = 2u * key_dim + value_dim;
-    if (e->qwen_config.ssm_group_count != n_head ||
+    if (n_group == 0 ||
+        n_head % n_group != 0 ||
         e->qwen_config.ssm_inner % e->qwen_config.ssm_dt_rank != 0 ||
         l0->attn_qkv->dim[1] != qkv_dim ||
         l0->attn_gate->dim[1] != value_dim ||
@@ -23259,8 +24736,8 @@ int ds4_engine_qwen_gdn_zero_test(ds4_engine *e, int token) {
                                l0->attn_norm,
                                e->qwen_config.n_embd,
                                e->qwen_config.rms_eps) != 0 ||
-        qwen35_matvec_dense_any_scratch(qkv, &e->model, l0->attn_qkv, norm, NULL) != 0 ||
-        qwen35_matvec_dense_any_scratch(z, &e->model, l0->attn_gate, norm, NULL) != 0 ||
+        qwen35_matvec_dense_any_scratch(qkv, e, l0->attn_qkv, norm, NULL) != 0 ||
+        qwen35_matvec_dense_any_scratch(z, e, l0->attn_gate, norm, NULL) != 0 ||
         qwen35_matvec_f32(beta, &e->model, l0->ssm_beta, norm) != 0)
     {
         rc = 1;
@@ -23271,8 +24748,9 @@ int ds4_engine_qwen_gdn_zero_test(ds4_engine *e, int token) {
         for (uint32_t h = 0; h < n_head; h++) beta[h] = sigmoid_stable(beta[h]);
 
         for (uint32_t h = 0; h < n_head; h++) {
-            float *qh = conv + (uint64_t)h * state_dim;
-            float *kh = conv + key_dim + (uint64_t)h * state_dim;
+            const uint32_t group = qwen35_gdn_group_for_head(h, n_head, n_group);
+            float *qh = conv + (uint64_t)group * state_dim;
+            float *kh = conv + key_dim + (uint64_t)group * state_dim;
             qwen35_l2_norm_inplace(qh, state_dim);
             qwen35_l2_norm_inplace(kh, state_dim);
             double qk = 0.0;
@@ -23291,7 +24769,7 @@ int ds4_engine_qwen_gdn_zero_test(ds4_engine *e, int token) {
                                         n_head,
                                         value_head_dim,
                                         e->qwen_config.rms_eps) != 0 ||
-            qwen35_matvec_dense_any_scratch(out, &e->model, l0->ssm_out, gated, NULL) != 0)
+            qwen35_matvec_dense_any_scratch(out, e, l0->ssm_out, gated, NULL) != 0)
         {
             rc = 1;
         } else {
@@ -23741,7 +25219,7 @@ int ds4_engine_qwen_mtp_proj_test(ds4_engine *e, int token) {
     } else {
         memcpy(cat, en, (size_t)q->n_embd * sizeof(cat[0]));
         memcpy(cat + q->n_embd, hn, (size_t)q->n_embd * sizeof(cat[0]));
-        if (qwen35_matvec_dense_any_scratch(out, &e->model, l->nextn_eh_proj, cat, NULL) != 0) {
+        if (qwen35_matvec_dense_any_scratch(out, e, l->nextn_eh_proj, cat, NULL) != 0) {
             rc = 1;
         } else {
             qwen35_print_vec_stats("qwen mtp proj test", token, q->n_embd, tensor_type_name(l->nextn_eh_proj->type), out);
@@ -23796,7 +25274,7 @@ int ds4_engine_qwen_mtp_layer_test(ds4_engine *e, int token) {
     }
     memcpy(cat, en, (size_t)q->n_embd * sizeof(cat[0]));
     memcpy(cat + q->n_embd, hn, (size_t)q->n_embd * sizeof(cat[0]));
-    if (qwen35_matvec_dense_any_scratch(cur, &e->model, l->nextn_eh_proj, cat, NULL) != 0 ||
+    if (qwen35_matvec_dense_any_scratch(cur, e, l->nextn_eh_proj, cat, NULL) != 0 ||
         qwen35_layer_full_attn_self_out(e, il, cur, attn) != 0) {
         rc = 1;
         goto done;
@@ -24187,6 +25665,8 @@ done:
 
 static int qwen35_session_eval_main(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s || !s->engine || token < 0) return 1;
+    s->logits_argmax_valid = false;
+    s->logits_stale = false;
     ds4_engine *e = s->engine;
     const uint32_t n_main = e->qwen_config.n_layer - e->qwen_config.nextn_predict_layers;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
@@ -24218,18 +25698,56 @@ static int qwen35_session_eval_main(ds4_session *s, int token, char *err, size_t
         if (errlen) snprintf(err, errlen, "Qwen native eval has no scratch buffers");
         return 1;
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const int cuda_resident_rc = qwen35_session_eval_main_cuda_dense(s, token, err, errlen);
+    if (cuda_resident_rc > 0) return 0;
+    if (cuda_resident_rc < 0) return 1;
+#endif
     int rc = 0;
+    const bool profile = getenv("DS4_QWEN_PROFILE") != NULL;
+    const double t_all0 = profile ? now_sec() : 0.0;
+    double t_embed = 0.0;
+    double t_recurrent = 0.0;
+    double t_full = 0.0;
+    double t_residual = 0.0;
+    double t_ffn = 0.0;
+    double t_output = 0.0;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const uint64_t gpu_calls0 = s->qwen_state.gpu_mat_calls;
+    const uint64_t gpu_eligible0 = s->qwen_state.gpu_mat_eligible;
+    const uint64_t gpu_attempts0 = s->qwen_state.gpu_mat_attempts;
+    const uint64_t gpu_fallbacks0 = s->qwen_state.gpu_mat_fallbacks;
+    const uint64_t gpu_f32_calls0 = s->qwen_state.gpu_mat_f32_calls;
+    const uint64_t gpu_q3_calls0 = s->qwen_state.gpu_mat_q3_calls;
+    const uint64_t gpu_q5_calls0 = s->qwen_state.gpu_mat_q5_calls;
+    const uint64_t gpu_q6_calls0 = s->qwen_state.gpu_mat_q6_calls;
+    const uint64_t gpu_q4_1_calls0 = s->qwen_state.gpu_mat_q4_1_calls;
+    const uint64_t gpu_iq4_nl_calls0 = s->qwen_state.gpu_mat_iq4_nl_calls;
+    const uint64_t gpu_q3_eligible0 = s->qwen_state.gpu_mat_q3_eligible;
+    const uint64_t gpu_q6_eligible0 = s->qwen_state.gpu_mat_q6_eligible;
+    const uint64_t gpu_q4_1_eligible0 = s->qwen_state.gpu_mat_q4_1_eligible;
+    const uint64_t gpu_iq4_nl_eligible0 = s->qwen_state.gpu_mat_iq4_nl_eligible;
+    const uint64_t gpu_no_cuda0 = s->qwen_state.gpu_mat_no_cuda_cond;
+    const uint64_t gpu_in_bytes0 = s->qwen_state.gpu_mat_in_bytes_total;
+    const uint64_t gpu_out_bytes0 = s->qwen_state.gpu_mat_out_bytes_total;
+    const double gpu_write0 = s->qwen_state.gpu_mat_write_sec;
+    const double gpu_kernel0 = s->qwen_state.gpu_mat_kernel_sec;
+    const double gpu_read0 = s->qwen_state.gpu_mat_read_sec;
+#endif
 
+    double t0 = profile ? now_sec() : 0.0;
     if (qwen35_embed_token_to_f32(e, token, cur) != 0) {
         if (errlen) snprintf(err, errlen, "Qwen native eval failed token embedding");
         rc = 1;
         goto done;
     }
+    if (profile) t_embed += now_sec() - t0;
 
     uint32_t recurrent_index = 0;
     uint32_t full_index = 0;
     for (uint32_t il = 0; il < n_main; il++) {
         if (e->qwen_weights.layer[il].recurrent) {
+            t0 = profile ? now_sec() : 0.0;
             if (qwen35_layer_gdn_step_out(e,
                                           il,
                                           cur,
@@ -24242,23 +25760,32 @@ static int qwen35_session_eval_main(ds4_session *s, int token, char *err, size_t
                 rc = 1;
                 goto done;
             }
+            if (profile) t_recurrent += now_sec() - t0;
             recurrent_index++;
         } else {
+            t0 = profile ? now_sec() : 0.0;
             if (qwen35_layer_full_attn_step_out(s, il, full_index, pos, cur, attn) != 0) {
                 if (errlen) snprintf(err, errlen, "Qwen native eval failed full-attention layer %u", il);
                 rc = 1;
                 goto done;
             }
+            if (profile) t_full += now_sec() - t0;
             full_index++;
         }
 
+        t0 = profile ? now_sec() : 0.0;
         for (uint32_t i = 0; i < e->qwen_config.n_embd; i++) after_attn[i] = cur[i] + attn[i];
+        if (profile) t_residual += now_sec() - t0;
+        t0 = profile ? now_sec() : 0.0;
         if (qwen35_layer_ffn_out(e, il, after_attn, ffn, &s->qwen_state) != 0) {
             if (errlen) snprintf(err, errlen, "Qwen native eval failed FFN layer %u", il);
             rc = 1;
             goto done;
         }
+        if (profile) t_ffn += now_sec() - t0;
+        t0 = profile ? now_sec() : 0.0;
         for (uint32_t i = 0; i < e->qwen_config.n_embd; i++) next[i] = after_attn[i] + ffn[i];
+        if (profile) t_residual += now_sec() - t0;
 
         float *tmp = cur;
         cur = next;
@@ -24276,24 +25803,93 @@ static int qwen35_session_eval_main(ds4_session *s, int token, char *err, size_t
         memcpy(s->qwen_state.mtp_hidden, cur, (size_t)e->qwen_config.n_embd * sizeof(cur[0]));
     }
 
-    if (qwen35_rms_norm_tensor(norm,
-                               cur,
-                               &e->model,
-                               e->qwen_weights.output_norm,
-                               e->qwen_config.n_embd,
-                               e->qwen_config.rms_eps) != 0 ||
-        qwen35_output_logits(s->logits, e, norm, &s->qwen_state) != 0)
-    {
-        if (errlen) snprintf(err, errlen, "Qwen native eval failed output_norm/logits");
-        rc = 1;
-        goto done;
+    t0 = profile ? now_sec() : 0.0;
+    bool output_done = false;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool top_only = getenv("DS4_QWEN_CUDA_GREEDY_TOP_ONLY") != NULL &&
+                          e->backend == DS4_BACKEND_CUDA &&
+                          e->metal_ready &&
+                          e->mtp_draft_tokens <= 1 &&
+                          getenv("DS4_MTP_PROBE") == NULL;
+    if (top_only) {
+        qwen35_native_state *st = &s->qwen_state;
+        const uint64_t embd_bytes = (uint64_t)e->qwen_config.n_embd * sizeof(float);
+        int top = -1;
+        if (qwen35_gpu_tensor_ensure(&st->gpu_cur, &st->gpu_cur_bytes, embd_bytes) &&
+            ds4_gpu_tensor_write(st->gpu_cur, 0, cur, embd_bytes) &&
+            qwen35_cuda_output_logits_device(s, st->gpu_cur, true, &top)) {
+            s->logits_argmax_valid = top >= 0;
+            s->logits_stale = top >= 0;
+            s->logits_argmax_token = top;
+            output_done = true;
+        }
     }
+#endif
+    if (!output_done) {
+        if (qwen35_rms_norm_tensor(norm,
+                                   cur,
+                                   &e->model,
+                                   e->qwen_weights.output_norm,
+                                   e->qwen_config.n_embd,
+                                   e->qwen_config.rms_eps) != 0 ||
+            qwen35_output_logits(s->logits, e, norm, &s->qwen_state) != 0)
+        {
+            if (errlen) snprintf(err, errlen, "Qwen native eval failed output_norm/logits");
+            rc = 1;
+            goto done;
+        }
+    }
+    if (profile) t_output += now_sec() - t0;
 
     token_vec_push(&s->checkpoint, token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
 
 done:
+    if (profile) {
+        const double total = now_sec() - t_all0;
+        fprintf(stderr,
+                "ds4: qwen profile token=%d pos=%u total=%.3f ms embed=%.3f recurrent=%.3f full=%.3f residual=%.3f ffn=%.3f output=%.3f\n",
+                token,
+                pos,
+                total * 1000.0,
+                t_embed * 1000.0,
+                t_recurrent * 1000.0,
+                t_full * 1000.0,
+                t_residual * 1000.0,
+                t_ffn * 1000.0,
+                t_output * 1000.0);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        if (getenv("DS4_QWEN_CUDA_PROFILE") != NULL) {
+            fprintf(stderr,
+                    "ds4: qwen cuda matvec profile token=%d calls=%" PRIu64 " f32=%" PRIu64 " q3=%" PRIu64 " q5=%" PRIu64 " q6=%" PRIu64 " q4_1=%" PRIu64 " iq4_nl=%" PRIu64 " h2d=%.3f ms kernel=%.3f ms d2h=%.3f ms in=%.2f MiB out=%.2f MiB\n",
+                    token,
+                    s->qwen_state.gpu_mat_calls - gpu_calls0,
+                    s->qwen_state.gpu_mat_f32_calls - gpu_f32_calls0,
+                    s->qwen_state.gpu_mat_q3_calls - gpu_q3_calls0,
+                    s->qwen_state.gpu_mat_q5_calls - gpu_q5_calls0,
+                    s->qwen_state.gpu_mat_q6_calls - gpu_q6_calls0,
+                    s->qwen_state.gpu_mat_q4_1_calls - gpu_q4_1_calls0,
+                    s->qwen_state.gpu_mat_iq4_nl_calls - gpu_iq4_nl_calls0,
+                    (s->qwen_state.gpu_mat_write_sec - gpu_write0) * 1000.0,
+                    (s->qwen_state.gpu_mat_kernel_sec - gpu_kernel0) * 1000.0,
+                    (s->qwen_state.gpu_mat_read_sec - gpu_read0) * 1000.0,
+                    (double)(s->qwen_state.gpu_mat_in_bytes_total - gpu_in_bytes0) / 1048576.0,
+                    (double)(s->qwen_state.gpu_mat_out_bytes_total - gpu_out_bytes0) / 1048576.0);
+            fprintf(stderr,
+                    "ds4: qwen cuda matvec dispatch token=%d eligible=%" PRIu64 " attempts=%" PRIu64 " fallbacks=%" PRIu64 " q3_eligible=%" PRIu64 " q6_eligible=%" PRIu64 " q4_1_eligible=%" PRIu64 " iq4_nl_eligible=%" PRIu64 " no_cuda_cond=%" PRIu64 "\n",
+                    token,
+                    s->qwen_state.gpu_mat_eligible - gpu_eligible0,
+                    s->qwen_state.gpu_mat_attempts - gpu_attempts0,
+                    s->qwen_state.gpu_mat_fallbacks - gpu_fallbacks0,
+                    s->qwen_state.gpu_mat_q3_eligible - gpu_q3_eligible0,
+                    s->qwen_state.gpu_mat_q6_eligible - gpu_q6_eligible0,
+                    s->qwen_state.gpu_mat_q4_1_eligible - gpu_q4_1_eligible0,
+                    s->qwen_state.gpu_mat_iq4_nl_eligible - gpu_iq4_nl_eligible0,
+                    s->qwen_state.gpu_mat_no_cuda_cond - gpu_no_cuda0);
+        }
+#endif
+    }
     return rc;
 }
 
@@ -24588,8 +26184,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     const ds4_model_family family = model_family(&e->model);
-    if (family == DS4_MODEL_FAMILY_QWEN35_DENSE ||
-        family == DS4_MODEL_FAMILY_QWEN35_MOE)
+    const bool qwen_family = (family == DS4_MODEL_FAMILY_QWEN35_DENSE ||
+                              family == DS4_MODEL_FAMILY_QWEN35_MOE);
+    if (qwen_family)
     {
         e->qwen_compat = true;
         qwen35_validate_model(&e->model, &e->qwen_config, &e->qwen_weights);
@@ -24598,29 +26195,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 0;
         }
         vocab_load(&e->vocab, &e->model);
-        *out = e;
-        return 0;
+    } else {
+        if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
+        config_validate_model(&e->model);
+        weights_bind(&e->weights, &e->model);
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->mtp_path && opt->mtp_path[0] &&
+            opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+            model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+            mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
+            e->mtp_ready = true;
+            fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
+                    opt->mtp_path,
+                    e->mtp_draft_tokens);
+        }
     }
-    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
-    config_validate_model(&e->model);
-    weights_bind(&e->weights, &e->model);
-    if (opt->inspect_only) {
-        *out = e;
-        return 0;
-    }
-    if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
+    if (qwen_family && load_slice) {
+        fprintf(stderr, "ds4: Qwen native CUDA currently requires full-model mapping\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
-    }
-    if (opt->mtp_path && opt->mtp_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
-        mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
-        e->mtp_ready = true;
-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
-                opt->mtp_path,
-                e->mtp_draft_tokens);
     }
 
 #ifndef DS4_NO_GPU
@@ -25672,6 +27274,7 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 int ds4_session_argmax(ds4_session *s) {
     if (!s) return -1;
+    if (s->logits_argmax_valid) return s->logits_argmax_token;
     return sample_argmax(s->logits, ds4_session_vocab_size(s));
 }
 
@@ -25699,6 +27302,7 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s) return 0;
+    if (temperature <= 0.0f && s->logits_argmax_valid) return s->logits_argmax_token;
     return sample_top_p_min_p(s->logits, ds4_session_vocab_size(s), temperature, top_k, top_p, min_p, rng);
 }
 
@@ -25765,6 +27369,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out) return 0;
+    if (s->logits_stale) return 0;
     const uint32_t n_vocab = ds4_session_vocab_size(s);
     if (cap < (int)n_vocab) return 0;
     memcpy(out, s->logits, (size_t)n_vocab * sizeof(out[0]));
@@ -25776,6 +27381,8 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     const uint32_t n_vocab = ds4_session_vocab_size(s);
     if (n != (int)n_vocab) return 1;
     memcpy(s->logits, logits, (size_t)n_vocab * sizeof(s->logits[0]));
+    s->logits_argmax_valid = false;
+    s->logits_stale = false;
     return 0;
 }
 

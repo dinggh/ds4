@@ -5,11 +5,12 @@ Date: 2026-05-30
 Owner: ds4 runtime
 
 Implementation note: the current tree contains the native Qwen GGUF
-inspector/tokenizer entry point, native CPU-reference Qwen generation, and an
-explicit llama.cpp compatibility backend for cross-checking one-shot generation.
-The compatibility backend is intentionally isolated: it proves the model file,
-tokenizer, CLI, and Qwen GGUF workflow while native Gated DeltaNet/Metal kernels
-are implemented.
+inspector/tokenizer entry point, native Qwen generation, an explicit llama.cpp
+compatibility backend for cross-checking one-shot generation, and first CUDA
+single-token matvec kernels for the Qwen3.6 dense GGUF formats available on the
+Spark host. The compatibility backend is intentionally isolated: it proves the
+model file, tokenizer, CLI, and Qwen GGUF workflow while native Gated
+DeltaNet/Metal/CUDA kernels are implemented.
 
 This document specifies how to add high-performance inference support for
 Qwen3.5 and Qwen3.6 dense and MoE text models. The goal is not generic Qwen
@@ -1048,6 +1049,14 @@ Current implementation:
   isolation. Remaining M2 expansion work is adding external reference golden
   vectors for Qwen3.6 dense once a local Qwen3.6 dense GGUF is available, then
   moving the CPU reference path to high-throughput Metal/CUDA kernels.
+- Spark CUDA host validation on `ecs_spark_001` now covers real Qwen3.6-27B
+  dense GGUFs under `~/models/Qwen3.6-27B-MTP-GGUF`. The Qwen3.6-27B-Q3_K_S
+  inspector reports 64 main layers, 48 recurrent GDN layers, 16 full-attention
+  layers, 1 MTP/NextN block, `embd=5120`, `heads=24`, `kv_heads=4`,
+  `dt_rank=48`, and `groups=16`. This exposed two Qwen3.6-specific runtime
+  gaps that are now fixed: GDN Q/K projections use grouped heads when
+  `ssm_group_count != ssm_dt_rank`, and explicit `output.weight` may use any
+  supported dense/quantized matvec format instead of being restricted to Q8_0.
 
 ### M3: CPU MoE Qwen3.6-35B-A3B Correctness
 
@@ -1162,6 +1171,336 @@ Acceptance:
 - CUDA backend implements chunked GDN prefill or documents a measured fallback.
 - Dense and MoE pass the same correctness suite.
 
+Current implementation:
+
+- `make cuda-spark` builds on `ecs_spark_001` with CUDA 13.0 and NVIDIA GB10.
+- Real Qwen3.6-27B dense GGUF native decode runs under the CUDA build. The
+  measured path now initializes CUDA, registers the GGUF model map, prepares the
+  Spark HBM tensor-span cache, and dispatches supported Qwen quantized matvecs
+  to CUDA. It is not yet a fully device-resident fused GDN/FFN/logits path.
+  Short benchmark command:
+  `QWEN_BENCH_BACKEND=cuda QWEN_BENCH_RUNS=1 QWEN_BENCH_PROMPT_REPEATS=1
+  QWEN_BENCH_GEN_TOKENS=1 QWEN_BENCH_CTX=1024 ./scripts/qwen35_bench.sh`.
+- Initial `ecs_spark_001` Qwen3.6-27B reference-path results:
+
+| Model | Backend | Prefill t/s | Gen t/s | Notes |
+| --- | --- | ---: | ---: | --- |
+| Qwen3.6-27B-Q3_K_S.gguf | cuda build | 0.47 | 0.46 | Native reference path |
+| Qwen3.6-27B-Q3_K_M.gguf | cuda build | 0.52 | 0.52 | Native reference path |
+| Qwen3.6-27B-Q4_1.gguf | cuda build | 0.42 | 0.43 | Native reference path |
+| Qwen3.6-27B-IQ4_NL.gguf | cuda build | 0.49 | 0.50 | Native reference path |
+
+- Current `ecs_spark_001` Qwen3.6-27B CUDA results, command shape:
+  `env DS4_QWEN_COMPAT_GENERATE=0 DS4_QWEN_NATIVE_GENERATE=1 ./ds4 --cuda
+  -m ~/models/Qwen3.6-27B-MTP-GGUF/<model> -p hi -n 16 -c 1024 --temp 0
+  --nothink`.
+
+| Model | CUDA coverage | Prefill t/s | Gen t/s | Baseline gen t/s | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| Qwen3.6-27B-Q3_K_S.gguf | Q3_K striped2 matvec + dense FFN + recurrent GDN + full-attention decode | 3.88 | 3.93 | 0.46 | Correct default path |
+| Qwen3.6-27B-Q3_K_M.gguf | Q3_K striped2 matvec + dense FFN + recurrent GDN + full-attention decode | 1.49 | 1.49 | 0.52 | Correct default path |
+| Qwen3.6-27B-Q4_1.gguf | Q4_1 striped-f32 matvec + dense FFN + recurrent GDN beta/alpha F32 pair + full-attention Q/K/V triple | 9.86 | 10.20 | 0.43 | Correct default path |
+| Qwen3.6-27B-IQ4_NL.gguf | IQ4_NL striped-f32 matvec + dense FFN + recurrent GDN + full-attention decode | 5.42 | 5.53 | 0.50 | Correct default path |
+
+- Same-host llama.cpp reference, built from current upstream with
+  `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121` on the same NVIDIA GB10:
+  `./build/bin/llama-bench -m
+  ~/models/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q4_1.gguf -ngl -1 -fa on -p 23
+  -n 16 -b 2048 -ub 2048 -r 3 -o jsonl`.
+
+| Runtime | CUDA graphs | Prefill t/s | Decode t/s | Notes |
+| --- | --- | ---: | ---: | --- |
+| llama.cpp | default | 211.72 | 12.70 | `qwen35 27B Q4_1`, full GPU offload, FlashAttention |
+| llama.cpp | `GGML_CUDA_DISABLE_GRAPHS=1` | 218.16 | 12.86 | Graphs are not the main delta for this short decode |
+| ds4 native | default | 9.86 | 10.20 | Token-by-token prompt path, striped Q4_1 f32-activation matvecs plus GDN beta/alpha and full-attention Q/K/V pair/triple kernels |
+
+- CUDA single-token matvec kernels are now wired for F32, Q3_K, Q4_1, Q5_K,
+  IQ4_NL, and Q6_K. Q6_K is needed for tied/explicit output-head variants even
+  though the current Spark Qwen3.6 dense GGUFs did not exercise Q6_K in the
+  final measured profile. F32 and Q5_K are required for Qwen GDN beta/alpha and
+  `ssm_out` projections. CUDA dispatch profiling confirmed zero fallback for
+  Q3_K_M, Q4_1, and IQ4_NL. Earlier final-token profile data before F32/Q5_K:
+  - Q3_K_M: 208 Q3_K calls/token, H2D 2.55 ms, kernel 1.66 ms, D2H 50.17 ms.
+  - Q4_1: 352 Q4_1 calls/token, H2D 1.99 ms, kernel 1.29 ms, D2H 120.09 ms.
+  - IQ4_NL: 288 IQ4_NL calls/token, H2D 2.84 ms, kernel 1.66 ms, D2H 217.09 ms.
+  After the Q4_1 striped-f32 default, Q4_1 profiling reports 496 logical CUDA
+  matvecs per token: 352 Q4_1, 96 F32, and 48 Q5_K. The measured matvec kernel
+  enqueue section was about 1.9 ms/token before GDN beta/alpha pairing, while
+  the CPU-visible synchronization point still accounted for about
+  89-90 ms/token. This confirms the next large Q4_1 gain must reduce
+  launch/synchronization count or fuse larger recurrent and FFN subgraphs;
+  further single-kernel micro-optimizations on F32/Q5_K alone are unlikely to
+  close the remaining llama.cpp gap.
+  These numbers proved the first CPU/GPU ping-pong bottleneck. After the
+  resident path removed most host transfers, llama.cpp still decodes about
+  1.8x faster, so the remaining bottleneck is the CUDA kernel schedule itself:
+  ds4 still uses simple f32-activation quant matvecs and many per-layer launches,
+  while ggml uses tuned MMVQ/MMQ kernels and specialized Qwen recurrent kernels.
+- Dense FFN now has a partial device-resident subgraph for CUDA-supported
+  quantized tensors: RMSNorm is still computed on CPU, then the normalized input
+  is written once to GPU, gate/up matvecs run on device, SwiGLU runs on device,
+  the down projection runs on device, and only the final embedding-sized FFN
+  output is read back. On Q4_1 this reduced final-token readback from about
+  13.94 MiB/token to 5.44 MiB/token and raised generation from 3.06 to
+  3.18 t/s in the short benchmark. The limited gain confirms the next major
+  speedup must come from recurrent GDN and full-attention state staying on GPU.
+- Recurrent GDN single-token decode now keeps the convolution cache and
+  recurrent state on device by default for CUDA-supported tensor formats. It
+  fuses the causal conv/cache update, Q/K L2 normalization, recurrent state
+  update, gated RMSNorm, and `ssm_out` projection into the CUDA decode path.
+  The previous correctness mismatch was caused by reusing the single global
+  CUDA temp allocation for both GDN conv and output temporaries; the kernel now
+  allocates one combined scratch span and slices it explicitly. `-p hi -n 16
+  --temp 0 --nothink` matches the GDN-disabled path on all four Spark GGUFs.
+  The fallback switch is `DS4_QWEN_DISABLE_CUDA_GDN=1`.
+- Recurrent GDN beta/alpha projections now use a default F32 pair matvec when
+  both tensors are F32 and have matching dimensions. The kernel preserves the
+  original per-row warp reduction order for each projection but computes beta
+  and alpha in one launch, removing 48 launches per Qwen3.6-27B token while
+  keeping the profiling counters as two logical F32 matvec calls. Spark Q4_1
+  short greedy validation matched the old path exactly (`stdout_cmp=0`).
+  Profiled recurrent time improved from about `27.5 ms/token` to
+  `26.4 ms/token`, and unprofiled alternating runs measured default
+  `9.82-9.85/10.16-10.19 t/s` versus rollback
+  `9.70-9.73/10.04-10.07 t/s`. The rollback switch is
+  `DS4_QWEN_DISABLE_CUDA_GDN_BETA_ALPHA_PAIR=1`.
+- Full-attention K/V projections now use a default Q4_1 pair matvec when both
+  tensors are Q4_1 and have matching dimensions. This is intentionally scoped
+  to the validated striped-f32 Q4_1 path and is disabled when the Q4_1 half16
+  or activation-Q8 experiments are selected. It removes 16 launches per
+  Qwen3.6-27B token on Q4_1. Spark short greedy validation matched rollback
+  exactly (`stdout_cmp=0`); profiled full-attention time moved from about
+  `7.17 ms/token` to about `7.0 ms/token`, and alternating unprofiled runs
+  measured default `9.50-9.91/10.19-10.22 t/s` versus rollback
+  `9.80-9.82/10.16-10.17 t/s`. The rollback switch is
+  `DS4_QWEN_DISABLE_CUDA_FULL_KV_PAIR=1`.
+- Full-attention Q/K/V projections now also have a Q4_1 triple matvec path that
+  replaces the QG projection plus the K/V pair with one launch when all three
+  tensors are Q4_1. The triple path keeps the validated striped-f32 reduction
+  order for each projected row and falls back to K/V pair or scalar matvecs
+  under the same experiment guards. Spark Q4_1 short validation matched
+  rollback exactly (`stdout_cmp=0`). Profiled full-attention time moved from
+  about `7.0 ms/token` to `6.85-6.96 ms/token`; unprofiled alternating runs
+  measured default `9.84-9.87/10.18-10.22 t/s` versus rollback
+  `9.51-9.84/10.17-10.19 t/s`. The gain is small, but launch count moves in
+  the right direction. The rollback switch is
+  `DS4_QWEN_DISABLE_CUDA_FULL_QKV_TRIPLE=1`.
+- The GDN state-update kernel now defaults to the block32 launch shape. It keeps
+  the original shared-memory reduction algorithm but uses 32 threads per
+  `(head,value_column)` block instead of 256, matching Qwen's small state vector
+  better. Spark Q4_1 logprob validation over 16 greedy steps matched the old
+  kernel exactly (`selected_equal=true`, common top-logit max diff `0.0`), and
+  `-n 32` throughput improved from `6.76/6.91 t/s` to `7.02/7.19 t/s`.
+  The current default groups four value columns per block with the same
+  shared-memory reduction order as block32; Spark Q4_1 validation matched
+  exactly (`selected_equal=true`, common top-logit max diff `0.0`) and measured
+  `7.02/7.19 t/s` vs standalone block32 `6.94/7.19 t/s` on `-n 32`.
+  `DS4_QWEN_DISABLE_CUDA_GDN_SHARED4=1` restores standalone block32, and
+  `DS4_QWEN_DISABLE_CUDA_GDN_BLOCK32=1` restores the old 256-thread launch. A
+  more llama.cpp-like four-column warp-shuffle kernel remains experimental
+  behind `DS4_QWEN_ENABLE_CUDA_GDN_WARP4=1`; it was faster (`7.04/7.21 t/s`)
+  but failed greedy-token validation, so it must not become default without a
+  reduction/layout fix.
+- The GDN L2-normalization and gated-RMS kernels now default to 128 threads per
+  block instead of 256. Qwen3.6-27B reports `state=128` and
+  `value_head_dim=128`, so the old launch spent half its lanes on empty work.
+  Spark Q4_1 logprob validation matched exactly against the old launch
+  (`selected_equal=true`, common top-logit max diff `0.0`). The measured effect
+  is small but non-negative (`6.96/7.19 t/s` old norm launch vs
+  `7.01/7.19 t/s` default norm128 on `-n 32`). The rollback switch is
+  `DS4_QWEN_DISABLE_CUDA_GDN_BLOCK128=1`.
+- A wider eight-column GDN state kernel exists behind
+  `DS4_QWEN_ENABLE_CUDA_GDN_SHARED8=1`. It keeps the exact shared-memory
+  reduction order used by the validated block32/shared4 kernels, and Spark Q4_1
+  JSONL logprob dumps matched the default path byte-for-byte (`cmp_rc=0`) over
+  the short greedy validation. It did not improve throughput (`6.99/7.19 t/s`
+  vs default `7.01/7.19 t/s` on `-n 32`), so shared4 remains the default. This
+  bounds the remaining GDN state-launch win: simply grouping more value columns
+  is not enough to close the llama.cpp decode gap.
+- Full-attention single-token decode now has a Qwen-specific CUDA path for
+  supported tensor formats. It keeps Q/K/V projection outputs on device, applies
+  per-head Q/K RMSNorm, Qwen M-RoPE, f16 K/V cache update, causal GQA attention,
+  attention gate, and output projection on CUDA. The normal fast path does not
+  read K/V back to host per token; snapshot serialization synchronizes the full
+  CUDA KV cache when needed. `DS4_QWEN_DISABLE_CUDA_FULL_ATTN=1` restores the
+  CPU full-attention body, and `DS4_QWEN_SYNC_CUDA_FULL_KV=1` forces eager host
+  KV synchronization for debugging.
+- An experimental dense-only resident CUDA decode path exists behind
+  `DS4_QWEN_ENABLE_CUDA_RESIDENT=1`. It keeps hidden, recurrent/full attention,
+  residual adds, FFN, final norm, and logits on device across the main-layer
+  loop. It is intentionally not default yet: after fixing GDN's resident
+  head-count mapping to use `ssm_dt_rank` rather than Q attention heads, it runs
+  through Q4_1 short greedy decode, but the measured short prompt is still
+  about equal to the default path. After the block32/block128 GDN launch
+  changes, Q4_1 `-n 32` still measured slightly below default
+  (`6.97/7.14 t/s` resident vs `6.98/7.19 t/s` default).
+- Resident profiling is now available with
+  `DS4_QWEN_CUDA_RESIDENT_PROFILE=1`. On Spark Q4_1 it shows each token issuing
+  497 CUDA matvecs with zero fallback and no host transfer inside the resident
+  matvec path. The apparent `hidden_read` or `output` cost of about 132-140 ms
+  is the final synchronization point for the full queued token workload, not a
+  large activation copy. An opt-in greedy path
+  `DS4_QWEN_CUDA_GREEDY_TOP_ONLY=1` computes GPU argmax and reads only the token
+  id instead of full logits; it measured `6.94 t/s`, essentially unchanged from
+  the resident full-logits path. The remaining bottleneck is therefore launch
+  count and unfused per-layer work, not logits D2H.
+- The same greedy top-only shortcut is now also wired into the default
+  non-resident CUDA path behind `DS4_QWEN_CUDA_GREEDY_TOP_ONLY=1`. It writes the
+  final hidden vector to CUDA, performs output RMSNorm, logits projection, and
+  argmax on device, and reads only the token id. Spark Q4_1 output stayed
+  unchanged, but generation did not improve (`6.94 t/s` vs clean default
+  `6.95 t/s`, prefill `6.78 t/s` vs `6.61 t/s`). This confirms the default
+  path's final logits D2H is also not the limiting factor.
+- A narrower add+RMSNorm fusion exists as an experiment behind
+  `DS4_QWEN_ENABLE_CUDA_ADD_RMS_FUSION=1`. It combines
+  `after_attn = cur + attn` and the following FFN RMSNorm into one kernel. Spark
+  Q4_1 profiling showed lower apparent per-section timings, but no generation
+  gain (`6.92 t/s`) and worse prompt throughput in the profiled run
+  (`4.11 t/s` vs `6.76 t/s` with the fusion disabled). Retesting after the
+  striped-f32 matvec change showed it is now neutral for decode (`10.04-10.07
+  t/s`) and output-identical on the short greedy check, but still not a clear
+  win. Keep it opt-in; it proves that isolated one-kernel fusions are
+  insufficient compared with a whole-token captured/fused schedule.
+- A llama.cpp-inspired Q4_1 FFN `gate + up + SwiGLU` pair kernel exists behind
+  `DS4_QWEN_ENABLE_CUDA_FFN_PAIR=1`. It was tested on Spark Q4_1 and is also
+  kept opt-in: the naive fused row kernel reduced prompt throughput
+  (`4.09 t/s` vs `6.79 t/s`) and did not improve decode (`6.95 t/s` vs
+  `6.96 t/s`). This validates the design rule that ds4 should borrow ggml's
+  MMVQ-style activation quantization and tiling, not just merge adjacent row
+  kernels.
+- A first Q4_1 activation-q8 experiment exists behind
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V=1`. It quantizes each activation vector to a
+  q8_1-style block tensor and runs a Q4_1 x Q8_1 row kernel. This also remains
+  opt-in only: after fixing the Q4_1 `m * sum(x)` accumulation bug, Spark Q4_1
+  still produced visibly different greedy tokens and measured worse throughput
+  (`3.94/6.49 t/s` vs clean default `6.71/6.94 t/s`). The failure mode is useful:
+  a separate q8 quantization launch plus scalar lane math is not enough. A
+  follow-up variant replaced the scalar lane inner loop with packed `dp4a`, but
+  remained incorrect for greedy output and became slower (`3.05/4.35 t/s`).
+  The production path must use ggml-like vectorized MMVQ tiling and must pass a
+  logits acceptance gate before it can replace the f32-activation Q4_1 kernel;
+  simply wrapping ds4's row-per-warp schedule with q8_1 is counterproductive.
+- The Q4_1 activation-q8 path now has a striped dp4a variant that distributes
+  eight Q4_1 blocks across all 32 lanes of the row warp. It is the first
+  Q4_1 experiment that moves performance in the right direction: Spark Q4_1
+  `-n 32` measured about `9.68/10.02 t/s`, versus the clean default
+  `6.98/7.18 t/s` and the old Q8V row kernel `4.38/4.42 t/s`. It is still not
+  production-correct. Full Q8V changes the short greedy top token from default
+  `59` to `79320`; FFN-only, gate/up-only, and down-only splits also fail the
+  top-1 acceptance gate over the same validation. A reconstructed-sum q8_1
+  variant (`DS4_QWEN_CUDA_Q8_1_RECON_SUM=1`, storing `d * sum(qs)` rather than
+  the original float sum) changes the failure mode but does not restore default
+  top-1. Keep these switches opt-in:
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V=1` for full Q4_1,
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V_FFN=1` for FFN-only,
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V_FFN_GATEUP=1` for gate/up,
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_Q8V_FFN_DOWN=1` for down, and
+  `DS4_QWEN_DISABLE_CUDA_Q4_1_Q8V_STRIPED=1` to restore the old Q8V row kernel.
+  The result is still valuable: it proves GB10 wants the MMVQ lane/block
+  schedule, but ds4 needs a logits-acceptable q8 quantization/fusion design
+  before this can become the default high-performance path.
+- The same lane/block schedule now exists for Q4_1 with f32 activations and is
+  the default Q4_1 CUDA matvec. It keeps activation precision unchanged while
+  distributing eight Q4_1 blocks across all 32 lanes of the row warp. Spark
+  Q4_1 short greedy validation matched the old default top-1 for all 16 checked
+  steps (`top1_match=16/16`); common top-logit max difference was about
+  `0.00125`, caused by the changed reduction order. Throughput improved from
+  the old kernel's `7.01/7.18 t/s` to `9.72-9.73/10.07 t/s` on `-n 32`,
+  closing most of the gap to llama.cpp's `12.70 t/s` short decode. The rollback
+  switch is `DS4_QWEN_DISABLE_CUDA_Q4_1_STRIPED_F32=1`. The older half-warp
+  experiment remains available with `DS4_QWEN_ENABLE_CUDA_Q4_1_HALF16=1`.
+- A wider Q4_1 f32 striped16 experiment exists behind
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_STRIPED16_F32=1`. It maps sixteen Q4_1 blocks
+  across the row warp, but this made the schedule slower on NVIDIA GB10 despite
+  matching the default greedy output (`stdout_cmp=0`): Spark Q4_1 profiled
+  generation fell to about `7.85 t/s`, with FFN/recurrent synchronization time
+  increasing sharply. Keep striped8 as the default; striped16 is a documented
+  negative result.
+- IQ4_NL now uses the same eight-block striped f32-activation row schedule by
+  default. Spark IQ4_NL short greedy validation matched the old kernel top-1
+  for all 16 checked steps (`top1_match=16/16`) with common top-logit max diff
+  about `0.00062`. Throughput improved from the old kernel's `3.91-3.96 t/s`
+  to `5.39-5.42/5.49-5.53 t/s` on `-n 32`. The rollback switch is
+  `DS4_QWEN_DISABLE_CUDA_IQ4_NL_STRIPED=1`.
+- Q3_K now has a two-superblock striped row kernel by default. It uses both
+  half-warps per row to process two Q3_K superblocks at a time while preserving
+  f32 activations. Spark Q3_K_S and Q3_K_M short greedy validation matched the
+  old kernel top-1 for all 8 checked steps; common top-logit max diff stayed
+  below about `0.0011`. The throughput effect is positive but small:
+  Q3_K_S improved from `3.80/3.85 t/s` to `3.88/3.93 t/s`, and Q3_K_M improved
+  from `1.47/1.45 t/s` to `1.49/1.49 t/s`. The rollback switch is
+  `DS4_QWEN_DISABLE_CUDA_Q3_K_STRIPED=1`.
+- A four-superblock Q3_K striped variant exists behind
+  `DS4_QWEN_ENABLE_CUDA_Q3_K_STRIPED4=1`. It also passed the Spark short top-1
+  validation for Q3_K_S and Q3_K_M, but the throughput tradeoff is
+  model-dependent: Q3_K_S improved in one run (`3.90` to `4.12 t/s` decode),
+  while Q3_K_M slightly regressed (`1.47` to `1.45 t/s`). Keep striped2 as the
+  default until ds4 can select Q3_K kernels from stronger per-model profiling
+  evidence.
+- A striped Q4_1 FFN `gate + up + SwiGLU` pair kernel exists behind
+  `DS4_QWEN_ENABLE_CUDA_FFN_PAIR=1` and can be forced back to the old pair
+  kernel with `DS4_QWEN_DISABLE_CUDA_FFN_PAIR_STRIPED=1`. It matches the
+  current default logits exactly on the Spark Q4_1 short validation, but it did
+  not improve `-n 32` throughput (`10.05-10.06 t/s` either way), so it remains
+  opt-in.
+- A Q4_1 half-warp matvec experiment exists behind
+  `DS4_QWEN_ENABLE_CUDA_Q4_1_HALF16=1`. It maps one row to 16 lanes instead of a
+  full warp, so a 256-thread block covers 16 rows rather than 8. Spark Q4_1
+  logprob validation matched the default exactly (`selected_equal=true`, common
+  top-logit max diff `0.0`), but throughput regressed (`6.74/6.90 t/s` vs
+  default warp8 `7.02/7.19 t/s` on `-n 32`). Keep it opt-in; on GB10 the current
+  row-per-warp schedule is faster despite half-warp lane under-utilization.
+- llama.cpp implementation details that are directly relevant:
+  - `src/models/qwen35.cpp` builds Qwen3.5/3.6 as a hybrid DeltaNet model,
+    routes recurrent layers through `llm_build_delta_net_base`, uses Q/K norms,
+    M-RoPE, FlashAttention-capable full-attention layers, and marks MTP layers
+    as non-recurrent.
+  - `ggml/src/ggml-cuda/gated_delta_net.cu` runs GDN recurrence with a
+    warp/column register-sharded kernel over tokens, heads, sequence slots, and
+    value columns. ds4's current GDN path is single-token and split across more
+    kernels.
+  - `ggml/src/ggml-cuda/mmvq.cu` quantizes activations to q8_1 blocks and uses
+    typed vector-dot kernels, including gate/GLU fusion. ds4 currently dots raw
+    f32 activations against GGUF rows.
+  - `benches/dgx-spark/dgx-spark.md` uses GB10, full GPU offload,
+    FlashAttention, and large `n_batch`/`n_ubatch`; ds4's native prefill remains
+    token-by-token and therefore cannot match the 200+ t/s prompt number yet.
+- M8 remains open. These measurements are useful because they prove real
+  Qwen3.6 dense model compatibility on Spark and quantify the baseline, but they
+  also show that performance work must next target ggml-class projection/GDN
+  kernels and chunked prefill before CUDA Graph capture is expected to matter.
+- The DeepSeek V4 CUDA path is the implementation reference for the next Qwen
+  work, especially:
+  - `ds4_gpu_tensor` device-owned buffers and command batching so decode does
+    not bounce activations through host memory.
+  - model-map registration/spans and Spark HBM cache policy for hot tensors.
+  - quantized matvec entry points and fused pair projections for gate/up style
+    FFN work.
+  - decode/prefill attention kernels that keep KV state device-resident.
+  - GPU argmax/top-k plumbing for sampler variants; this is useful for API
+    shape, but Qwen resident measurements show it is not the primary speed
+    limiter by itself.
+- Qwen3.6 Spark optimization order:
+  1. Port an MMVQ-style CUDA matvec path for Q4_1 first: q8_1 activation
+     quantization, tuned row/block scheduling for GB10, and fused gate/up GLU
+     using ggml's `mmvq.cu` design rather than ds4's naive row-pair or scalar
+     Q8V kernels. Acceptance requires matching greedy output on the Spark Q4_1
+     smoke prompt and improving decode throughput over the clean default.
+  2. Replace the current split GDN decode with a Qwen Gated DeltaNet kernel
+     shaped like ggml's `gated_delta_net.cu`, then extend it to multi-token
+     prompt chunks.
+  3. Add chunked native prefill (`n_batch`/`n_ubatch` equivalent) for recurrent
+     and full-attention layers. This is required to close the 6.8 vs 211 t/s
+     prefill gap.
+  4. Keep the Qwen GPU session state holding hidden/norm/qkv/gate/ffn/logits,
+     full-attention KV, residuals, and final sampler workspace on device. The
+     recurrent GDN state and convolution cache already live on device in the
+     CUDA decode path.
+  5. Evaluate CUDA Graph capture only after the matvec/GDN schedule resembles
+     llama.cpp; same-host llama.cpp data with graphs disabled did not regress.
+  6. Only after dense Qwen3.6 reaches an agreed Spark target should MoE expert
+     batching/offload be implemented.
+
 ### M9: Large Qwen3.5 MoE
 
 Acceptance:
@@ -1235,6 +1574,12 @@ project goal.
   https://github.com/ggml-org/llama.cpp/blob/master/conversion/qwen.py
 - ggml CUDA gated-delta-net kernel:
   https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/gated_delta_net.cu
+- ggml CUDA MMVQ quant matvec kernel:
+  https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/mmvq.cu
+- llama.cpp CUDA backend and graph controls:
+  https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/ggml-cuda.cu
+- llama.cpp DGX Spark benchmark notes:
+  https://github.com/ggml-org/llama.cpp/blob/master/benches/dgx-spark/dgx-spark.md
 - vLLM Qwen3.5 FLA tensor-format issue:
   https://github.com/vllm-project/vllm/issues/38643
 - vLLM hybrid GDN/attention FP8 KV-scale issue:
