@@ -2359,13 +2359,6 @@ __device__ static float half_warp_sum_f32(float v) {
     return v;
 }
 
-__device__ static double warp_sum_f64(double v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
-    }
-    return v;
-}
-
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
@@ -3779,16 +3772,16 @@ __global__ static void qwen35_gdn_l2_norm_kernel(
     uint32_t lane = threadIdx.x;
     if (row >= n_group * 2u) return;
     float *x = conv + (uint64_t)row * state_dim;
-    double ss = 0.0;
-    for (uint32_t i = lane; i < state_dim; i += blockDim.x) ss += (double)x[i] * (double)x[i];
-    __shared__ double partial[256];
+    float ss = 0.0f;
+    for (uint32_t i = lane; i < state_dim; i += blockDim.x) ss += x[i] * x[i];
+    __shared__ float partial[256];
     partial[lane] = ss;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1u; stride > 0; stride >>= 1u) {
         if (lane < stride) partial[lane] += partial[lane + stride];
         __syncthreads();
     }
-    const float scale = partial[0] > 0.0 ? 1.0f / sqrtf((float)partial[0]) : 0.0f;
+    const float scale = partial[0] > 0.0f ? 1.0f / sqrtf(partial[0]) : 0.0f;
     for (uint32_t i = lane; i < state_dim; i += blockDim.x) x[i] *= scale;
 }
 
@@ -3818,13 +3811,13 @@ __global__ static void qwen35_gdn_state_kernel(
     float *sv = state + ((uint64_t)h * value_head_dim + v) * state_dim;
     const float beta = cuda_sigmoid_stable(beta_pre[h]);
     const float decay = expf(cuda_softplus_stable(alpha[h] + dt[h]) * a[h]);
-    double kv = 0.0;
+    float kv = 0.0f;
     for (uint32_t s = lane; s < state_dim; s += blockDim.x) {
         const float decayed = sv[s] * decay;
         sv[s] = decayed;
-        kv += (double)decayed * (double)k[s];
+        kv += decayed * k[s];
     }
-    __shared__ double partial[256];
+    __shared__ float partial[256];
     partial[lane] = kv;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1u; stride > 0; stride >>= 1u) {
@@ -3832,11 +3825,11 @@ __global__ static void qwen35_gdn_state_kernel(
         __syncthreads();
     }
     const float delta = (val[v] - (float)partial[0]) * beta;
-    double ov = 0.0;
+    float ov = 0.0f;
     for (uint32_t s = lane; s < state_dim; s += blockDim.x) {
         const float updated = sv[s] + k[s] * delta;
         sv[s] = updated;
-        ov += (double)updated * (double)q[s];
+        ov += updated * q[s];
     }
     partial[lane] = ov;
     __syncthreads();
@@ -3874,21 +3867,21 @@ __global__ static void qwen35_gdn_state_warp4_kernel(
     float *sv = state + ((uint64_t)h * value_head_dim + v) * state_dim;
     const float beta = cuda_sigmoid_stable(beta_pre[h]);
     const float decay = expf(cuda_softplus_stable(alpha[h] + dt[h]) * a[h]);
-    double kv = 0.0;
+    float kv = 0.0f;
     for (uint32_t s = lane; s < state_dim; s += 32u) {
         const float decayed = sv[s] * decay;
         sv[s] = decayed;
-        kv += (double)decayed * (double)k[s];
+        kv += decayed * k[s];
     }
-    kv = warp_sum_f64(kv);
+    kv = warp_sum_f32(kv);
     const float delta = (val[v] - (float)kv) * beta;
-    double ov = 0.0;
+    float ov = 0.0f;
     for (uint32_t s = lane; s < state_dim; s += 32u) {
         const float updated = sv[s] + k[s] * delta;
         sv[s] = updated;
-        ov += (double)updated * (double)q[s];
+        ov += updated * q[s];
     }
-    ov = warp_sum_f64(ov);
+    ov = warp_sum_f32(ov);
     if (lane == 0) gdn[(uint64_t)h * value_head_dim + v] = (float)ov;
 }
 
@@ -3909,7 +3902,7 @@ __global__ static void qwen35_gdn_state_shared4_kernel(
     const uint32_t hv = blockIdx.x * 4u + col;
     const uint32_t h = hv / value_head_dim;
     const uint32_t v = hv - h * value_head_dim;
-    __shared__ double partial[4][32];
+    __shared__ float partial[4][32];
     const bool valid = h < n_head;
     const uint32_t heads_per_group = n_head / n_group;
     const uint32_t group = h / heads_per_group;
@@ -3920,11 +3913,11 @@ __global__ static void qwen35_gdn_state_shared4_kernel(
     float *sv = state + ((uint64_t)h * value_head_dim + v) * state_dim;
     const float beta = valid ? cuda_sigmoid_stable(beta_pre[h]) : 0.0f;
     const float decay = valid ? expf(cuda_softplus_stable(alpha[h] + dt[h]) * a[h]) : 0.0f;
-    double kv = 0.0;
+    float kv = 0.0f;
     for (uint32_t s = lane; valid && s < state_dim; s += 32u) {
         const float decayed = sv[s] * decay;
         sv[s] = decayed;
-        kv += (double)decayed * (double)k[s];
+        kv += decayed * k[s];
     }
     partial[col][lane] = kv;
     __syncthreads();
@@ -3933,11 +3926,11 @@ __global__ static void qwen35_gdn_state_shared4_kernel(
         __syncthreads();
     }
     const float delta = valid ? (val[v] - (float)partial[col][0]) * beta : 0.0f;
-    double ov = 0.0;
+    float ov = 0.0f;
     for (uint32_t s = lane; valid && s < state_dim; s += 32u) {
         const float updated = sv[s] + k[s] * delta;
         sv[s] = updated;
-        ov += (double)updated * (double)q[s];
+        ov += updated * q[s];
     }
     partial[col][lane] = ov;
     __syncthreads();
@@ -3965,7 +3958,7 @@ __global__ static void qwen35_gdn_state_shared8_kernel(
     const uint32_t hv = blockIdx.x * 8u + col;
     const uint32_t h = hv / value_head_dim;
     const uint32_t v = hv - h * value_head_dim;
-    __shared__ double partial[8][32];
+    __shared__ float partial[8][32];
     const bool valid = h < n_head;
     const uint32_t heads_per_group = n_head / n_group;
     const uint32_t group = h / heads_per_group;
@@ -3976,11 +3969,11 @@ __global__ static void qwen35_gdn_state_shared8_kernel(
     float *sv = state + ((uint64_t)h * value_head_dim + v) * state_dim;
     const float beta = valid ? cuda_sigmoid_stable(beta_pre[h]) : 0.0f;
     const float decay = valid ? expf(cuda_softplus_stable(alpha[h] + dt[h]) * a[h]) : 0.0f;
-    double kv = 0.0;
+    float kv = 0.0f;
     for (uint32_t s = lane; valid && s < state_dim; s += 32u) {
         const float decayed = sv[s] * decay;
         sv[s] = decayed;
-        kv += (double)decayed * (double)k[s];
+        kv += decayed * k[s];
     }
     partial[col][lane] = kv;
     __syncthreads();
@@ -3989,11 +3982,11 @@ __global__ static void qwen35_gdn_state_shared8_kernel(
         __syncthreads();
     }
     const float delta = valid ? (val[v] - (float)partial[col][0]) * beta : 0.0f;
-    double ov = 0.0;
+    float ov = 0.0f;
     for (uint32_t s = lane; valid && s < state_dim; s += 32u) {
         const float updated = sv[s] + k[s] * delta;
         sv[s] = updated;
-        ov += (double)updated * (double)q[s];
+        ov += updated * q[s];
     }
     partial[col][lane] = ov;
     __syncthreads();
@@ -4016,19 +4009,19 @@ __global__ static void qwen35_gdn_gated_rms_kernel(
     uint32_t lane = threadIdx.x;
     if (h >= n_head) return;
     const uint64_t off = (uint64_t)h * value_head_dim;
-    double ss = 0.0;
+    float ss = 0.0f;
     for (uint32_t i = lane; i < value_head_dim; i += blockDim.x) {
         const float v = gdn[off + i];
-        ss += (double)v * (double)v;
+        ss += v * v;
     }
-    __shared__ double partial[256];
+    __shared__ float partial[256];
     partial[lane] = ss;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1u; stride > 0; stride >>= 1u) {
         if (lane < stride) partial[lane] += partial[lane + stride];
         __syncthreads();
     }
-    const float scale = 1.0f / sqrtf((float)(partial[0] / (double)value_head_dim) + eps);
+    const float scale = 1.0f / sqrtf(partial[0] / (float)value_head_dim + eps);
     for (uint32_t i = lane; i < value_head_dim; i += blockDim.x) {
         gated[off + i] = gdn[off + i] * scale * weight[i] * cuda_silu(z[off + i]);
     }
