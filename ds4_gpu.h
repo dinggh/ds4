@@ -161,6 +161,15 @@ int ds4_gpu_matmul_q6_k_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
 
+int ds4_gpu_matmul_q2_k_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_f32_qwen_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -191,6 +200,60 @@ int ds4_gpu_matmul_q5_k_tensor(
         const ds4_gpu_tensor *x);
 
 int ds4_gpu_matmul_q3_k_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_q4_k_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_iq3_xxs_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_iq2_s_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_iq2_xs_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_iq3_s_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_matmul_iq4_xs_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -248,6 +311,16 @@ int ds4_gpu_matmul_q4_1_q8_1_tensor(
         const ds4_gpu_tensor *x_q8);
 
 int ds4_gpu_qwen35_gate_up_swiglu_q4_1_tensor(
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_qwen35_gate_up_swiglu_q2_k_tensor(
         ds4_gpu_tensor       *mid,
         const void             *model_map,
         uint64_t                model_size,

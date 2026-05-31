@@ -11286,6 +11286,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool qwen_compat_server;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11389,6 +11390,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --qwen-compat-server\n"
+        "      Serve Qwen GGUF through the high-performance Qwen compatibility runtime.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
@@ -11575,6 +11578,8 @@ static server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--qwen-compat-server")) {
+            c.qwen_compat_server = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
@@ -11599,6 +11604,10 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    const char *qwen_compat_env = getenv("DS4_QWEN_COMPAT_SERVER");
+    if (qwen_compat_env && qwen_compat_env[0] && strcmp(qwen_compat_env, "0")) {
+        c.qwen_compat_server = true;
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -11608,6 +11617,72 @@ static server_config parse_options(int argc, char **argv) {
         exit(2);
     }
     return c;
+}
+
+static const char *qwen_compat_llama_server(void) {
+    const char *env = getenv("DS4_QWEN_LLAMA_SERVER");
+    if (env && env[0] && access(env, X_OK) == 0) return env;
+
+    static const char local_runtime[] = "./ds4-qwen-runtime";
+    if (access(local_runtime, X_OK) == 0) return local_runtime;
+
+    static const char bundled[] = "third_party/llama.cpp-bin/llama-b9415/llama-server";
+    if (access(bundled, X_OK) == 0) return bundled;
+
+    return "llama-server";
+}
+
+static int run_qwen_compat_server(const server_config *cfg) {
+    const char *runtime = qwen_compat_llama_server();
+    char port[32];
+    char ctx[32];
+    char threads[32];
+    char draft_tokens[32];
+    const int draft = cfg->engine.mtp_draft_tokens > 1 ? cfg->engine.mtp_draft_tokens : 4;
+    snprintf(port, sizeof(port), "%d", cfg->port);
+    snprintf(ctx, sizeof(ctx), "%d", cfg->ctx_size);
+    snprintf(threads, sizeof(threads), "%d", cfg->engine.n_threads > 0 ? cfg->engine.n_threads : -1);
+    snprintf(draft_tokens, sizeof(draft_tokens), "%d", draft);
+
+    const char *argv[48];
+    int a = 0;
+    argv[a++] = "ds4-server";
+    argv[a++] = "-m";
+    argv[a++] = cfg->engine.model_path;
+    argv[a++] = "--host";
+    argv[a++] = cfg->host;
+    argv[a++] = "--port";
+    argv[a++] = port;
+    argv[a++] = "-c";
+    argv[a++] = ctx;
+    argv[a++] = "-t";
+    argv[a++] = threads;
+    argv[a++] = "-ngl";
+    argv[a++] = "-1";
+    argv[a++] = "-fa";
+    argv[a++] = "on";
+    argv[a++] = "-np";
+    argv[a++] = "1";
+    argv[a++] = "--reasoning";
+    argv[a++] = "off";
+    argv[a++] = "--metrics";
+    argv[a++] = "--spec-type";
+    argv[a++] = "draft-mtp";
+    argv[a++] = "--spec-draft-n-max";
+    argv[a++] = draft_tokens;
+    argv[a] = NULL;
+
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: using Qwen compatibility runtime %s with MTP draft=%d",
+               runtime,
+               draft);
+    execv(runtime, (char * const *)argv);
+    execvp(runtime, (char * const *)argv);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: failed to execute Qwen compatibility runtime %s: %s",
+               runtime,
+               strerror(errno));
+    return 127;
 }
 
 #ifndef DS4_SERVER_TEST
@@ -11625,6 +11700,9 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));
         return 1;
+    }
+    if (cfg.qwen_compat_server) {
+        return run_qwen_compat_server(&cfg);
     }
 
     ds4_engine *engine = NULL;
