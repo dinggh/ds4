@@ -25106,10 +25106,8 @@ static int qwen35_mtp_draft_logits_with_hidden(ds4_session *s,
 static int qwen35_mtp_draft_logits(ds4_session *s, int token, float *logits, int *top_out) {
     const bool approximate =
         (s && s->engine &&
-         (s->engine->qwen_mtp_approx_fast_accept ||
-          s->engine->qwen_mtp_approx_draft_only)) ||
-        getenv("DS4_QWEN_MTP_APPROX_FAST_ACCEPT") != NULL ||
-        getenv("DS4_QWEN_MTP_APPROX_DRAFT_ONLY") != NULL;
+         s->engine->qwen_mtp_approx_fast_accept) ||
+        getenv("DS4_QWEN_MTP_APPROX_FAST_ACCEPT") != NULL;
     return qwen35_mtp_draft_logits_with_hidden(s, token, NULL, approximate, logits, top_out);
 }
 
@@ -28442,11 +28440,30 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = draft;
             if (draft == eos_token || n_accept >= accepted_cap) break;
             if (approximate_fast) {
-                token_vec_push(&s->checkpoint, draft);
-                s->checkpoint_valid = true;
+                if (qwen_approx_draft_only) {
+                    qwen35_native_state *st = &s->qwen_state;
+                    if (st->mtp_cat && (st->mtp_pending_hidden || st->mtp_hidden)) {
+                        const float *prev_hidden = st->mtp_pending_hidden ?
+                            st->mtp_pending_hidden : st->mtp_hidden;
+                        memcpy(st->mtp_cat,
+                               prev_hidden,
+                               (size_t)e->qwen_config.n_embd * sizeof(st->mtp_cat[0]));
+                    }
+                    if (qwen35_session_eval_main_ex(s, draft, true, err, errlen) != 0) return -1;
+                } else {
+                    token_vec_push(&s->checkpoint, draft);
+                    s->checkpoint_valid = true;
+                }
                 int mtp_top = -1;
                 float *draft_logits = getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL;
-                if (qwen35_mtp_draft_logits(s, draft, draft_logits, &mtp_top) == 0) {
+                const float *h_override = NULL;
+                if (qwen_approx_draft_only && s->qwen_state.mtp_cat) {
+                    h_override = s->qwen_state.mtp_cat;
+                }
+                const int draft_rc = h_override ?
+                    qwen35_mtp_draft_logits_with_hidden(s, draft, h_override, false, draft_logits, &mtp_top) :
+                    qwen35_mtp_draft_logits(s, draft, draft_logits, &mtp_top);
+                if (draft_rc == 0) {
                     s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(draft_logits, e->qwen_config.n_vocab);
                     s->mtp_draft_valid = true;
                     s->logits_argmax_valid = mtp_top >= 0;
