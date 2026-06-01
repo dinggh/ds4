@@ -99,6 +99,8 @@ typedef struct {
     int power_percent;
     bool warm_weights;
     bool quality;
+    bool qwen_mtp_approx_fast_accept;
+    bool qwen_mtp_approx_draft_only;
     bool inspect_only;
     bool load_slice;
     uint32_t load_layer_start;

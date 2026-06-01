@@ -188,6 +188,10 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --qwen-mtp-approx-fast-accept\n"
+        "      Use Qwen NextN draft tokens as an approximate fast-accept path for greedy decoding.\n"
+        "  --qwen-mtp-approx-draft-only\n"
+        "      Experimental Qwen throughput ceiling: recursively emit approximate MTP drafts after the first target token.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -480,7 +484,10 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
 static bool is_rendered_chat_prompt(const char *prompt) {
     const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
+    const char *qwen_im_start = "<|im_start|>";
+    return prompt &&
+           (strncmp(prompt, bos, strlen(bos)) == 0 ||
+            strncmp(prompt, qwen_im_start, strlen(qwen_im_start)) == 0);
 }
 
 typedef struct {
@@ -803,7 +810,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[17];
+        int toks[257];
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -1475,7 +1482,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        &rng);
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[17];
+        int toks[257];
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -1822,6 +1829,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--qwen-mtp-approx-fast-accept")) {
+            c.engine.qwen_mtp_approx_fast_accept = true;
+        } else if (!strcmp(arg, "--qwen-mtp-approx-draft-only")) {
+            c.engine.qwen_mtp_approx_draft_only = true;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {

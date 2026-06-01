@@ -11382,6 +11382,10 @@ static void usage(FILE *fp) {
         "      Change working directory before loading the model or runtime assets.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --qwen-mtp-approx-fast-accept\n"
+        "      Use Qwen NextN draft tokens as an approximate fast-accept path for greedy decoding.\n"
+        "  --qwen-mtp-approx-draft-only\n"
+        "      Experimental Qwen throughput ceiling: recursively emit approximate MTP drafts after the first target token.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -11562,6 +11566,10 @@ static server_config parse_options(int argc, char **argv) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--qwen-mtp-approx-fast-accept")) {
+            c.engine.qwen_mtp_approx_fast_accept = true;
+        } else if (!strcmp(arg, "--qwen-mtp-approx-draft-only")) {
+            c.engine.qwen_mtp_approx_draft_only = true;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {

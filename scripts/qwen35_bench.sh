@@ -10,6 +10,8 @@ REPEATS=${QWEN_BENCH_PROMPT_REPEATS:-64}
 RUNS=${QWEN_BENCH_RUNS:-3}
 THREADS=${QWEN_BENCH_THREADS:-}
 MTP_DRAFT=${QWEN_BENCH_MTP_DRAFT:-0}
+MTP_APPROX_FAST_ACCEPT=${QWEN_BENCH_MTP_APPROX_FAST_ACCEPT:-0}
+MTP_APPROX_DRAFT_ONLY=${QWEN_BENCH_MTP_APPROX_DRAFT_ONLY:-0}
 WARM_WEIGHTS=${QWEN_BENCH_WARM_WEIGHTS:-0}
 OUT=${QWEN_BENCH_CSV:-}
 MIN_PREFILL_TPS=${QWEN_BENCH_MIN_PREFILL_TPS:-}
@@ -90,6 +92,12 @@ run_once() {
   fi
   if [ "$MTP_DRAFT" != "0" ]; then
     set -- "$@" --mtp-draft "$MTP_DRAFT"
+  fi
+  if [ "$MTP_APPROX_FAST_ACCEPT" != "0" ]; then
+    set -- "$@" --qwen-mtp-approx-fast-accept
+  fi
+  if [ "$MTP_APPROX_DRAFT_ONLY" != "0" ]; then
+    set -- "$@" --qwen-mtp-approx-draft-only
   fi
 
   if ! DS4_QWEN_COMPAT_GENERATE=0 DS4_QWEN_NATIVE_GENERATE=1 "$@" >"$log_file" 2>&1; then
