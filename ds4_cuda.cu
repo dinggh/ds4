@@ -2802,19 +2802,27 @@ __device__ static uint32_t cuda_load_u32_le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-__device__ static int8_t cuda_q3_k_scale(const cuda_block_q3_K *b, int idx) {
+typedef struct {
+    uint32_t aux[4];
+} cuda_q3_k_scales;
+
+__device__ static cuda_q3_k_scales cuda_q3_k_scales_load(const cuda_block_q3_K *b) {
     const uint32_t kmask1 = 0x03030303u;
     const uint32_t kmask2 = 0x0f0f0f0fu;
-    uint32_t aux[4];
-    aux[0] = cuda_load_u32_le(b->scales + 0);
-    aux[1] = cuda_load_u32_le(b->scales + 4);
-    aux[2] = cuda_load_u32_le(b->scales + 8);
-    const uint32_t tmp = aux[2];
-    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    const uint32_t word = aux[(uint32_t)idx >> 2u];
+    cuda_q3_k_scales s;
+    s.aux[0] = cuda_load_u32_le(b->scales + 0);
+    s.aux[1] = cuda_load_u32_le(b->scales + 4);
+    s.aux[2] = cuda_load_u32_le(b->scales + 8);
+    const uint32_t tmp = s.aux[2];
+    s.aux[2] = ((s.aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    s.aux[3] = ((s.aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    s.aux[0] = (s.aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    s.aux[1] = (s.aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    return s;
+}
+
+__device__ static int8_t cuda_q3_k_scale_get(cuda_q3_k_scales s, int idx) {
+    const uint32_t word = s.aux[(uint32_t)idx >> 2u];
     return (int8_t)((word >> (((uint32_t)idx & 3u) * 8u)) & 0xffu);
 }
 
@@ -2833,6 +2841,7 @@ __global__ static void matmul_q3_k_warp8_kernel(
     for (uint64_t ib = 0; ib < row_blocks; ib++) {
         const cuda_block_q3_K *b = blocks + ib;
         const float d_all = cuda_f16_bits_to_f32(b->d);
+        const cuda_q3_k_scales scales = cuda_q3_k_scales_load(b);
         if (lane < 16u) {
             for (int n128 = 0; n128 < 2; n128++) {
                 const uint8_t *q = b->qs + n128 * 32;
@@ -2840,10 +2849,10 @@ __global__ static void matmul_q3_k_warp8_kernel(
                 const float *xb = x + ib * CUDA_QK_K + n128 * 128;
                 for (int shift = 0; shift < 4; shift++) {
                     const uint8_t mask = (uint8_t)(1u << (n128 * 4 + shift));
-                    float dl = d_all * (float)(cuda_q3_k_scale(b, n128 * 8 + shift * 2 + 0) - 32);
+                    float dl = d_all * (float)(cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 0) - 32);
                     const int q0 = (int)((q[lane + 0] >> (2 * shift)) & 3u) - ((hm[lane + 0] & mask) ? 0 : 4);
                     acc += dl * (float)q0 * xb[shift * 32 + lane];
-                    dl = d_all * (float)(cuda_q3_k_scale(b, n128 * 8 + shift * 2 + 1) - 32);
+                    dl = d_all * (float)(cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 1) - 32);
                     const int q1 = (int)((q[lane + 16] >> (2 * shift)) & 3u) - ((hm[lane + 16] & mask) ? 0 : 4);
                     acc += dl * (float)q1 * xb[shift * 32 + 16 + lane];
                 }
@@ -2872,17 +2881,18 @@ __global__ static void matmul_q3_k_striped2_kernel(
         if (ib >= row_blocks) continue;
         const cuda_block_q3_K *b = blocks + ib;
         const float d_all = cuda_f16_bits_to_f32(b->d);
+        const cuda_q3_k_scales scales = cuda_q3_k_scales_load(b);
         for (int n128 = 0; n128 < 2; n128++) {
             const uint8_t *q = b->qs + n128 * 32;
             const uint8_t *hm = b->hmask;
             const float *xb = x + ib * CUDA_QK_K + n128 * 128;
             for (int shift = 0; shift < 4; shift++) {
                 const uint8_t mask = (uint8_t)(1u << (n128 * 4 + shift));
-                float dl = d_all * (float)(cuda_q3_k_scale(b, n128 * 8 + shift * 2 + 0) - 32);
+                float dl = d_all * (float)(cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 0) - 32);
                 const int q0 = (int)((q[sub_lane + 0] >> (2 * shift)) & 3u) -
                                ((hm[sub_lane + 0] & mask) ? 0 : 4);
                 acc += dl * (float)q0 * xb[shift * 32 + sub_lane];
-                dl = d_all * (float)(cuda_q3_k_scale(b, n128 * 8 + shift * 2 + 1) - 32);
+                dl = d_all * (float)(cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 1) - 32);
                 const int q1 = (int)((q[sub_lane + 16] >> (2 * shift)) & 3u) -
                                ((hm[sub_lane + 16] & mask) ? 0 : 4);
                 acc += dl * (float)q1 * xb[shift * 32 + 16 + sub_lane];
@@ -2911,14 +2921,15 @@ __global__ static void matmul_q3_k_striped4_kernel(
         if (ib >= row_blocks) continue;
         const cuda_block_q3_K *b = blocks + ib;
         const float d_all = cuda_f16_bits_to_f32(b->d);
+        const cuda_q3_k_scales scales = cuda_q3_k_scales_load(b);
         for (int n128 = 0; n128 < 2; n128++) {
             const uint8_t *q = b->qs + n128 * 32;
             const uint8_t *hm = b->hmask;
             const float *xb = x + ib * CUDA_QK_K + n128 * 128;
             for (int shift = 0; shift < 4; shift++) {
                 const uint8_t mask = (uint8_t)(1u << (n128 * 4 + shift));
-                const float dl0 = d_all * (float)(cuda_q3_k_scale(b, n128 * 8 + shift * 2 + 0) - 32);
-                const float dl1 = d_all * (float)(cuda_q3_k_scale(b, n128 * 8 + shift * 2 + 1) - 32);
+                const float dl0 = d_all * (float)(cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 0) - 32);
+                const float dl1 = d_all * (float)(cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 1) - 32);
                 for (uint32_t part = 0; part < 2u; part++) {
                     const uint32_t l = sub_lane + part * 8u;
                     const int q0 = (int)((q[l + 0u] >> (2 * shift)) & 3u) -
@@ -11882,6 +11893,7 @@ __device__ static int32_t dev_dot_q3_16(const uint8_t *q3,
 
 __device__ static float dev_dot_q3_K_q8_K_block(const cuda_block_q3_K *x, const cuda_block_q8_K *y) {
     const float d = dev_f16_to_f32(x->d) * y->d;
+    const cuda_q3_k_scales scales = cuda_q3_k_scales_load(x);
     int32_t isum = 0;
     for (int n128 = 0; n128 < 2; n128++) {
         const uint8_t *q = x->qs + n128 * 32;
@@ -11889,8 +11901,8 @@ __device__ static float dev_dot_q3_K_q8_K_block(const cuda_block_q3_K *x, const 
         const int8_t *q8 = y->qs + n128 * 128;
         for (int shift = 0; shift < 4; shift++) {
             const uint8_t mask = (uint8_t)(1u << (n128 * 4 + shift));
-            const int sc0 = (int)cuda_q3_k_scale(x, n128 * 8 + shift * 2 + 0) - 32;
-            const int sc1 = (int)cuda_q3_k_scale(x, n128 * 8 + shift * 2 + 1) - 32;
+            const int sc0 = (int)cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 0) - 32;
+            const int sc1 = (int)cuda_q3_k_scale_get(scales, n128 * 8 + shift * 2 + 1) - 32;
             isum += sc0 * dev_dot_q3_16(q + 0, hm + 0, q8 + shift * 32 + 0, shift, mask);
             isum += sc1 * dev_dot_q3_16(q + 16, hm + 16, q8 + shift * 32 + 16, shift, mask);
         }
